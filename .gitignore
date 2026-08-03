@@ -260,3 +260,7 @@ paket-files/
 __pycache__/
 *.pyc
 LibreSpotUWP/librespot.dll
+
+# Packaged release output
+release/
+
