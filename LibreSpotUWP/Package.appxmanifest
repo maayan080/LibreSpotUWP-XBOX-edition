@@ -7,22 +7,22 @@
   IgnorableNamespaces="uap mp uap3">
 
   <Identity
-    Name="34151aa6-2b17-4a37-bddb-2ee83fdf53e4"
-    Publisher="CN=MegaBytesMe"
-    Version="1.0.4.0" />
+    Name="Spotbox.LibreSpotXbox"
+    Publisher="CN=Spotbox"
+    Version="1.1.2.0" />
 
   <mp:PhoneIdentity PhoneProductId="34151aa6-2b17-4a37-bddb-2ee83fdf53e4"
                     PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
   <Properties>
-    <DisplayName>LibreSpotUWP</DisplayName>
-    <PublisherDisplayName>MegaBytesMe</PublisherDisplayName>
+    <DisplayName>Spotbox</DisplayName>
+    <PublisherDisplayName>Spotbox (fork of LibreSpotUWP by MegaBytesMe)</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
 
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Universal"
-                        MinVersion="10.0.15063.0"
+                        MinVersion="10.0.17763.0"
                         MaxVersionTested="10.0.17763.0" />
   </Dependencies>
 
@@ -36,12 +36,12 @@
                  EntryPoint="LibreSpotUWP.App">
 
       <uap:VisualElements
-        DisplayName="LibreSpotUWP"
+        DisplayName="Spotbox"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png"
         Description="LibreSpotUWP is a Spotify client designed with UWP in mind, powered by LibreSpot."
         BackgroundColor="transparent">
-        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square71x71Logo="Assets\SmallTile.png" Square310x310Logo="Assets\LargeTile.png"/>
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"/>
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
 
@@ -57,7 +57,20 @@
 
   <Capabilities>
     <Capability Name="internetClient" />
+    <Capability Name="privateNetworkClientServer" />
     <uap3:Capability Name="backgroundMediaPlayback"/>
     <DeviceCapability Name="webcam"/>
   </Capabilities>
 </Package>
+
+
+
+
+
+
+
+
+
+
+
+

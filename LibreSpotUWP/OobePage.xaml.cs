@@ -51,6 +51,8 @@ namespace LibreSpotUWP
 
             UpdateDirectSignInUi();
             await RefreshSignedInStateAsync();
+
+            await StartPairingServerAsync();
         }
 
         private void OobePage_Unloaded(object sender, RoutedEventArgs e)
@@ -60,6 +62,62 @@ namespace LibreSpotUWP
                 App.SpotifyAuth.AuthStateChanged -= SpotifyAuth_AuthStateChanged;
                 _listeningForAuthState = false;
             }
+
+            StopPairingServer();
+        }
+
+        private Services.XboxPairingServer _pairingServer;
+
+        private async Task StartPairingServerAsync()
+        {
+            if (!OSHelper.IsXboxFamily) { return; }
+            if (_pairingServer != null) { return; }
+
+            try
+            {
+                _pairingServer = new Services.XboxPairingServer();
+                _pairingServer.SessionReceived += PairingServer_SessionReceived;
+
+                if (!await _pairingServer.StartAsync())
+                {
+                    StopPairingServer();
+                    return;
+                }
+
+                PairingUrlText.Text = _pairingServer.Url;
+                PairingQrImage.Source =
+                    await Services.BarcodeUIService.GenerateQrCodeBitmapAsync(_pairingServer.Url, 260);
+                PairingPanel.Visibility = Visibility.Visible;
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn("Pairing server could not start: " + ex.Message);
+                StopPairingServer();
+            }
+        }
+
+        private void StopPairingServer()
+        {
+            var server = _pairingServer;
+            _pairingServer = null;
+
+            if (server != null)
+            {
+                server.SessionReceived -= PairingServer_SessionReceived;
+                server.Dispose();
+            }
+        }
+
+        private async void PairingServer_SessionReceived(object sender, string session)
+        {
+            await Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, async () =>
+            {
+                StopPairingServer();
+                PairingPanel.Visibility = Visibility.Collapsed;
+
+                await QrLoginHelper.ImportQrLoginAsync(session, App.SpotifyAuth, SetBusy);
+                await RefreshSignedInStateAsync();
+            });
         }
 
         private async void SpotifyAuth_AuthStateChanged(object sender, AuthState e)
@@ -100,6 +158,12 @@ namespace LibreSpotUWP
 
         private async void BtnSpotifySignIn_Click(object sender, RoutedEventArgs e)
         {
+            if (OSHelper.IsXboxFamily)
+            {
+                Frame?.Navigate(typeof(XboxLoginPage));
+                return;
+            }
+
             TxtAuthStatus.Text = "Waiting for Spotify to return to LibreSpotUWP...";
             await App.SpotifyAuth.BeginPkceLoginAsync();
         }
@@ -251,10 +315,41 @@ namespace LibreSpotUWP
             ClientIdTextBox.Text = UserSettings.SpotifyCustomClientId;
 
             var hasClientId = UserSettings.HasSpotifyCustomClientId;
-            BtnSpotifySignIn.Visibility = hasClientId ? Visibility.Visible : Visibility.Collapsed;
+
+            BtnSpotifySignIn.Visibility = Visibility.Visible;
+
             DirectSignInStatusText.Text = hasClientId
                 ? "Direct browser sign-in is enabled for this device."
-                : "Direct browser sign-in is optional and needs a Spotify client ID. Leave this empty and use the Login Helper if you are not sure.";
+                : "Sign in with your Spotify account in the browser. A custom client ID is optional - leave it blank to use the built-in one.";
+
+            if (OSHelper.IsXboxFamily)
+            {
+                BtnScanQr.Visibility = Visibility.Collapsed;
+                BtnOpenHelper.Visibility = Visibility.Collapsed;
+                ReorderForXbox();
+            }
+        }
+
+        private void ReorderForXbox()
+        {
+            var panel = SignInOptionsPanel;
+            if (panel == null) { return; }
+
+            const int insertAt = 2;
+
+            MoveChildTo(panel, DirectSignInPanel, insertAt);
+            MoveChildTo(panel, PairingPanel, insertAt + 1);
+        }
+
+        private static void MoveChildTo(Panel parent, UIElement child, int index)
+        {
+            if (child == null) { return; }
+
+            int current = parent.Children.IndexOf(child);
+            if (current < 0) { return; }
+
+            parent.Children.RemoveAt(current);
+            parent.Children.Insert(Math.Min(index, parent.Children.Count), child);
         }
 
         private void SetBusy(bool isBusy)

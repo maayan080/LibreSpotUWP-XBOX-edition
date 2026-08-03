@@ -1,3 +1,20 @@
+﻿> ## Xbox edition — a fork of [LibreSpotUWP](https://github.com/megabytesme/LibreSpotUWP)
+>
+> **All credit for this application goes to [megabytesme](https://github.com/megabytesme).**
+> They built LibreSpotUWP — the entire Spotify client, and the UWP-safe native build of
+> [librespot](https://github.com/librespot-org/librespot) that makes playback possible.
+> Please go star [their repository](https://github.com/megabytesme/LibreSpotUWP).
+>
+> This fork only adds support for running on **Xbox in Developer Mode**, so music keeps
+> playing in the background while you use the dashboard or run homebrew. The changes are
+> small and listed in **[README-SPOTBOX-FORK.md](README-SPOTBOX-FORK.md)**.
+>
+> Licensed **CC BY-NC-SA 4.0**, inherited from upstream: attribution required,
+> non-commercial use only, and derivatives must share alike. See [LICENSE.md](LICENSE.md).
+>
+> The original upstream README follows.
+
+---
 | <h1>LibreSpotUWP</h1> | <img src="https://github.com/user-attachments/assets/b53f3efe-a089-4e68-8caa-57a0bf2693a9" width="60" height="60"> |
 | --- | --- |
 
@@ -8,7 +25,7 @@
 | Lumia 950 XL | Surface Duo | PC |
 |--------------|-------------|-------------|
 | <img width="250" height="440" alt="Lumia 950 XL - Windows 10 Mobile - Now Playing Page" src="https://github.com/user-attachments/assets/9c04b10f-d6fb-497e-b5a1-9a6a4d5a62a0" /> <img width="250" height="440" alt="Lumia 950 XL - Windows 10 Mobile - Lyrics Page using Spotify Colour Theme" src="https://github.com/user-attachments/assets/b84d7866-a252-4612-b0e6-e0301d8d6b71" /> | TODO: Add photos | <img width="666" height="444" alt="Windows 11 - Liked Songs Page" src="https://github.com/user-attachments/assets/f74e715f-85ab-4d7e-acb4-d21a02980b5b" /> <img width="666" height="444" alt="Windows 11 - Lyrics Page using Spotify Colour Theme" src="https://github.com/user-attachments/assets/6ab08ecf-9a84-40df-9df1-4493f3552104" /> |
-| _Windows 10 Mobile – 15254.603, ARM_ | _Andromeda OS (8828080) – 18236.1000, ARM64_ | _Windows 11 - 26200.8655, X64_ |
+| _Windows 10 Mobile â€“ 15254.603, ARM_ | _Andromeda OS (8828080) â€“ 18236.1000, ARM64_ | _Windows 11 - 26200.8655, X64_ |
 
 ## Features
 
@@ -58,7 +75,7 @@ Building LibreSpotUWP is unique because it combines a C# UWP Host with a Rust Dy
     *   **10.0.16299.0** (Required for ARM64 compatibility).
  
 ## **1. Building the librespot Core (Rust)**  
-librespot is written in Rust and compiled as a **UWP‑safe DLL** (`librespot.dll`).  
+librespot is written in Rust and compiled as a **UWPâ€‘safe DLL** (`librespot.dll`).  
 
 1) **Clone this librespot repository fork: https://github.com/megabytesme/librespot**
 
@@ -93,8 +110,9 @@ LibreSpotUWP.sln
 ### **Steps:**
 1. Copy the generated `librespot.dll` into the **root directory** of the UWP project you intend to run.  
 2. In Visual Studio, set **Solution Platform** to match your target device:  
-   - `ARM` → Windows 10 Mobile (MUST BE RELEASE BUILD)  
-   - `ARM64` → HoloLens 2, Windows on ARM  
-   - `x86` → Emulators, older PCs  
-   - `x64` → Modern PCs  
+   - `ARM` â†’ Windows 10 Mobile (MUST BE RELEASE BUILD)  
+   - `ARM64` â†’ HoloLens 2, Windows on ARM  
+   - `x86` â†’ Emulators, older PCs  
+   - `x64` â†’ Modern PCs  
 3. Press **F5** to deploy and run.
+

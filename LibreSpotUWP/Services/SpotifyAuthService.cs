@@ -1,4 +1,4 @@
-using LibreSpotUWP.Constants;
+﻿using LibreSpotUWP.Constants;
 using LibreSpotUWP.Exceptions;
 using LibreSpotUWP.Interfaces;
 using LibreSpotUWP.Helpers;
@@ -23,6 +23,9 @@ namespace LibreSpotUWP.Services
         private string _codeVerifier;
         private string _pendingClientId;
 
+        private Uri _pendingRedirect;
+
+
         private const string StorageKey = "spotify_auth_state";
         private const int RequiredScopeVersion = 4;
         private const int RequiredAuthVersion = 1;
@@ -42,6 +45,9 @@ namespace LibreSpotUWP.Services
         public async Task BeginPkceLoginAsync()
         {
             var clientId = UserSettings.SpotifyCustomClientId;
+            if (string.IsNullOrWhiteSpace(clientId))
+                clientId = Constants.SpotifyConfig.DefaultClientId;
+
             if (string.IsNullOrWhiteSpace(clientId))
                 return;
 
@@ -81,6 +87,51 @@ namespace LibreSpotUWP.Services
             await Windows.System.Launcher.LaunchUriAsync(login.ToUri());
         }
 
+        public Uri PreparePkceLoginUri()
+        {
+            var clientId = UserSettings.SpotifyCustomClientId;
+            if (string.IsNullOrWhiteSpace(clientId))
+                clientId = Constants.SpotifyConfig.DefaultClientId;
+
+            if (string.IsNullOrWhiteSpace(clientId))
+                return null;
+
+            var (verifier, challenge) = PKCEUtil.GenerateCodes();
+            _codeVerifier = verifier;
+            _pendingClientId = clientId;
+
+            _pendingRedirect = new Uri(SpotifyConfig.LoopbackRedirectUri);
+
+            var login = new LoginRequest(
+                _pendingRedirect,
+                clientId,
+                LoginRequest.ResponseType.Code)
+            {
+                CodeChallenge = challenge,
+                CodeChallengeMethod = "S256",
+                Scope = new[]
+                {
+                    Scopes.UserReadEmail,
+                    Scopes.UserReadPrivate,
+                    Scopes.PlaylistReadPrivate,
+                    Scopes.PlaylistReadCollaborative,
+                    Scopes.Streaming,
+                    Scopes.UserReadRecentlyPlayed,
+                    Scopes.UserTopRead,
+                    Scopes.UserLibraryRead,
+                    Scopes.UserLibraryModify,
+                    Scopes.PlaylistModifyPrivate,
+                    Scopes.PlaylistModifyPublic,
+                    Scopes.UserReadPlaybackState,
+                    Scopes.UserModifyPlaybackState,
+                    Scopes.UserReadCurrentlyPlaying,
+                    Scopes.UserFollowRead
+                }
+            };
+
+            return login.ToUri();
+        }
+
         public async Task ExchangePkceCodeAsync(string code)
         {
             if (string.IsNullOrEmpty(_codeVerifier))
@@ -93,7 +144,7 @@ namespace LibreSpotUWP.Services
             if (string.IsNullOrWhiteSpace(clientId))
                 return;
 
-            var redirect = new Uri(SpotifyConfig.AppRedirectUri);
+            var redirect = _pendingRedirect ?? new Uri(SpotifyConfig.AppRedirectUri);
 
             var request = new PKCETokenRequest(
                 clientId,
@@ -123,6 +174,7 @@ namespace LibreSpotUWP.Services
             LogService.Info("[SpotifyAuthService.ExchangePkceCodeAsync] PKCE auth state persisted.");
             _codeVerifier = null;
             _pendingClientId = null;
+            _pendingRedirect = null;
         }
 
         public async Task RefreshAsync()
@@ -551,3 +603,4 @@ namespace LibreSpotUWP.Services
         }
     }
 }
+

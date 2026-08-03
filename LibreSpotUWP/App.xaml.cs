@@ -57,6 +57,9 @@ namespace LibreSpotUWP
         public App()
         {
             InitializeComponent();
+
+            Helpers.XboxExperience.Apply();
+
             Suspending += OnSuspending;
             Resuming += OnResuming;
             UnhandledException += App_UnhandledException;

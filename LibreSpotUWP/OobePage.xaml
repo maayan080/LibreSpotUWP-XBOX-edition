@@ -125,7 +125,7 @@
                         </Grid.RowDefinitions>
 
                         <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
-                            <StackPanel Padding="40">
+                            <StackPanel x:Name="SignInOptionsPanel" Padding="40">
                                 <TextBlock
                                     Margin="0,0,0,8"
                                     FontSize="24"
@@ -185,6 +185,37 @@
                                         </StackPanel>
                                     </Grid>
                                 </Button>
+
+                                <Border
+                                    x:Name="PairingPanel"
+                                    Padding="20"
+                                    Background="#1E1E1E"
+                                    CornerRadius="8"
+                                    Visibility="Collapsed">
+                                    <StackPanel>
+                                        <TextBlock
+                                            FontWeight="SemiBold"
+                                            Text="Sign in from your phone or PC" />
+                                        <TextBlock
+                                            Margin="0,4,0,12"
+                                            Opacity="0.72"
+                                            Text="Scan this code, or open the address below in a browser on any device on your network. Paste the details from the Login Helper there and they will be sent straight to this Xbox."
+                                            TextWrapping="Wrap" />
+                                        <Image
+                                            x:Name="PairingQrImage"
+                                            Width="260"
+                                            Height="260"
+                                            Margin="0,0,0,12"
+                                            HorizontalAlignment="Left" />
+                                        <TextBlock
+                                            x:Name="PairingUrlText"
+                                            FontFamily="Consolas"
+                                            FontSize="20"
+                                            Foreground="#1DB954"
+                                            IsTextSelectionEnabled="True"
+                                            Text="" />
+                                    </StackPanel>
+                                </Border>
 
                                 <Button
                                     x:Name="BtnPasteDetails"

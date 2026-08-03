@@ -10,6 +10,9 @@ namespace LibreSpotUWP.Interfaces
         event EventHandler<AuthState> AuthStateChanged;
 
         Task BeginPkceLoginAsync();
+
+        Uri PreparePkceLoginUri();
+
         Task ExchangePkceCodeAsync(string code);
         Task RefreshAsync();
         Task EnsureCurrentAccountIsPremiumAsync();
