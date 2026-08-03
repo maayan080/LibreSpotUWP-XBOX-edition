@@ -1,4 +1,4 @@
-﻿> ## Xbox edition — a fork of [LibreSpotUWP](https://github.com/megabytesme/LibreSpotUWP)
+> ## Xbox edition — a fork of [LibreSpotUWP](https://github.com/megabytesme/LibreSpotUWP)
 >
 > **All credit for this application goes to [megabytesme](https://github.com/megabytesme).**
 > They built LibreSpotUWP — the entire Spotify client, and the UWP-safe native build of
@@ -12,12 +12,9 @@
 > Licensed **CC BY-NC-SA 4.0**, inherited from upstream: attribution required,
 > non-commercial use only, and derivatives must share alike. See [LICENSE.md](LICENSE.md).
 
-<p align="center">
-  <img src="https://lh3.googleusercontent.com/d/1hSA_iUoTwoUQZpBEBOIo5psZdz1byDeC" width="300" alt="real rating" style="vertical-align: middle;">
-  <span style="display: inline-block; vertical-align: middle; margin-left: 15px;">
-    <strong>Note:</strong> This **fork** was made with the use of ai, find more about the rating [here](https://www.realgoodai.org/real-rating).
-  </span>
-</p>
+| <img src="https://lh3.googleusercontent.com/d/1hSA_iUoTwoUQZpBEBOIo5psZdz1byDeC" width="80" alt="real rating"> | **Note:** This **fork** was made with the use of AI. Read more about the rating [here](https://www.realgoodai.org/real-rating). |
+| :---: | :--- |
+
 > The original upstream README follows.
 
 ---
