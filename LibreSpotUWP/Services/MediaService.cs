@@ -231,6 +231,7 @@ namespace LibreSpotUWP.Services
 
             _librespot.TrackChanged += OnTrackChanged;
             _librespot.NarrationChanged += OnNarrationChanged;
+            _librespot.DjStateChanged += OnDjStateChanged;
             _librespot.PlaybackEvent += OnPlaybackChanged;
             _librespot.PositionChanged += OnPositionChanged;
             _librespot.SessionStateChanged += OnSessionStateChanged;
@@ -692,6 +693,7 @@ namespace LibreSpotUWP.Services
                     UpdateState(state =>
                     {
                         state.IsSpotifyDjContext = false;
+                        state.NextDjSetUid = null;
                         state.IsNarrationActive = false;
                         state.NarrationDurationMs = 0;
                         state.NarrationText = null;
@@ -746,6 +748,7 @@ namespace LibreSpotUWP.Services
             UpdateState(state =>
             {
                 state.IsSpotifyDjContext = true;
+                state.NextDjSetUid = null;
                 state.IsNarrationActive = false;
                 state.NarrationDurationMs = 0;
                 state.NarrationText = null;
@@ -755,6 +758,18 @@ namespace LibreSpotUWP.Services
             });
             UpdateSmtcDisplay();
             await PlayAsync(playlistUri, null);
+        }
+
+        public void NextSpotifyDjVibe()
+        {
+            var state = Current;
+            if (!state.IsSpotifyDjContext || string.IsNullOrWhiteSpace(state.NextDjSetUid) ||
+                !IsSelectedSpotifyConnectDeviceLocal)
+            {
+                return;
+            }
+
+            _librespot.NextDjSet(state.NextDjSetUid);
         }
 
         private async Task PlayOnlineQueueRecoveryAsync(string contextUri, string startUri)
@@ -2794,6 +2809,28 @@ namespace LibreSpotUWP.Services
             UpdateSmtcDisplay();
             _positionSynchronizer.Reset(0);
             UpdateSmtcTimeline(Current.PositionMs);
+        }
+
+        private void OnDjStateChanged(object sender, LibrespotDjState djState)
+        {
+            if (djState == null ||
+                !IsSelectedSpotifyConnectDeviceLocal ||
+                djState.SessionGeneration != _librespot.SessionGeneration)
+            {
+                return;
+            }
+
+            UpdateState(state =>
+            {
+                state.IsSpotifyDjContext = djState.IsDj;
+                state.NextDjSetUid = djState.IsDj ? djState.NextSetUid : null;
+                if (!djState.IsDj)
+                {
+                    state.IsNarrationActive = false;
+                    state.NarrationDurationMs = 0;
+                    state.NarrationText = null;
+                }
+            });
         }
 
         private async void OnPlaybackChanged(object sender, LibrespotPlaybackEvent playbackEvent)
@@ -5572,6 +5609,7 @@ namespace LibreSpotUWP.Services
             _playbackAuth.PlaybackAuthStateChanged -= OnPlaybackAuthChanged;
             _librespot.TrackChanged -= OnTrackChanged;
             _librespot.NarrationChanged -= OnNarrationChanged;
+            _librespot.DjStateChanged -= OnDjStateChanged;
             _librespot.PlaybackEvent -= OnPlaybackChanged;
             _librespot.PositionChanged -= OnPositionChanged;
             _librespot.SessionStateChanged -= OnSessionStateChanged;

@@ -75,6 +75,7 @@ namespace LibreSpotUWP.Services
         public event EventHandler<LibrespotSessionState> SessionStateChanged;
         public event EventHandler<LibrespotTrackInfo> TrackChanged;
         public event EventHandler<LibrespotNarrationState> NarrationChanged;
+        public event EventHandler<LibrespotDjState> DjStateChanged;
         public event EventHandler<LibrespotPlaybackState> PlaybackStateChanged;
         public event EventHandler<LibrespotPlaybackEvent> PlaybackEvent;
         public event EventHandler<LibrespotPositionUpdate> PositionChanged;
@@ -936,6 +937,22 @@ namespace LibreSpotUWP.Services
                 Librespot.librespot_next(_instance);
         }
 
+        public void NextDjSet(string expectedUid)
+        {
+            if (_instance == IntPtr.Zero || string.IsNullOrWhiteSpace(expectedUid))
+                return;
+
+            IntPtr expectedUidPtr = AllocUtf8String(expectedUid);
+            try
+            {
+                Librespot.librespot_dj_next_set(_instance, expectedUidPtr);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(expectedUidPtr);
+            }
+        }
+
         public void Previous()
         {
             if (_instance != IntPtr.Zero)
@@ -1156,6 +1173,21 @@ namespace LibreSpotUWP.Services
                     RaiseOnMainThread(
                         () => NarrationChanged?.Invoke(this, narration),
                         nameof(NarrationChanged),
+                        sessionGeneration);
+                    break;
+
+                case EventType.DjStateChanged:
+                    var djState = new LibrespotDjState
+                    {
+                        IsDj = evt.data.is_dj,
+                        NextSetUid = ReadString(evt.data.dj_next_set_uid),
+                        SessionGeneration = sessionGeneration
+                    };
+                    LogService.Info(
+                        $"{logPrefix} Spotify DJ {(djState.IsDj ? "active" : "inactive")}; next set available={!string.IsNullOrWhiteSpace(djState.NextSetUid)}.");
+                    RaiseOnMainThread(
+                        () => DjStateChanged?.Invoke(this, djState),
+                        nameof(DjStateChanged),
                         sessionGeneration);
                     break;
 

@@ -142,6 +142,9 @@ namespace LibreSpotUWP.Views.Win10_1507
 
             UpdateShuffleVisual(state.Shuffle);
             UpdateRepeatVisual(state.RepeatMode);
+            NextDjSetButton.Visibility = state.IsSpotifyDjContext && !string.IsNullOrWhiteSpace(state.NextDjSetUid)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
 
             VolumeSlider.ValueChanged -= VolumeSlider_ValueChanged;
             double volPercent = state.Volume * 100.0 / 65535.0;
@@ -224,6 +227,11 @@ namespace LibreSpotUWP.Views.Win10_1507
         private void NextButton_Click(object sender, RoutedEventArgs e)
         {
             Media.Next();
+        }
+
+        private void NextDjSetButton_Click(object sender, RoutedEventArgs e)
+        {
+            Media?.NextSpotifyDjVibe();
         }
 
         private async void ShuffleButton_Click(object sender, RoutedEventArgs e) => await Media.SetShuffleAsync(!Media.Current.Shuffle);

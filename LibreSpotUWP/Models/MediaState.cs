@@ -16,6 +16,7 @@ namespace LibreSpotUWP.Models
         public bool IsCurrentTrackPersisted { get; set; }
         public bool IsRecoveringOnlinePlayback { get; set; }
         public bool IsSpotifyDjContext { get; set; }
+        public string NextDjSetUid { get; set; }
         public bool IsNarrationActive { get; set; }
         public uint NarrationDurationMs { get; set; }
         public string NarrationText { get; set; }
@@ -71,6 +72,7 @@ namespace LibreSpotUWP.Models
                 IsCurrentTrackPersisted = this.IsCurrentTrackPersisted,
                 IsRecoveringOnlinePlayback = this.IsRecoveringOnlinePlayback,
                 IsSpotifyDjContext = this.IsSpotifyDjContext,
+                NextDjSetUid = this.NextDjSetUid,
                 IsNarrationActive = this.IsNarrationActive,
                 NarrationDurationMs = this.NarrationDurationMs,
                 NarrationText = this.NarrationText,

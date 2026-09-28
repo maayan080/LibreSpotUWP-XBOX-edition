@@ -77,11 +77,13 @@ namespace LibreSpotUWP.Interfaces
         uint GetPositionMs();
         void Seek(uint posMs);
         void Next();
+        void NextDjSet(string expectedUid);
         void Previous();
 
         event EventHandler<LibrespotSessionState> SessionStateChanged;
         event EventHandler<LibrespotTrackInfo> TrackChanged;
         event EventHandler<LibrespotNarrationState> NarrationChanged;
+        event EventHandler<LibrespotDjState> DjStateChanged;
         event EventHandler<LibrespotPlaybackState> PlaybackStateChanged;
         event EventHandler<LibrespotPlaybackEvent> PlaybackEvent;
         event EventHandler<LibrespotPositionUpdate> PositionChanged;

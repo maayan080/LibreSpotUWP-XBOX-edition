@@ -223,6 +223,7 @@
     <Compile Include="Models\LibrespotTrackInfo.cs" />
     <Compile Include="Models\LibrespotSessionState.cs" />
     <Compile Include="Models\LibrespotNarrationState.cs" />
+    <Compile Include="Models\LibrespotDjState.cs" />
     <Compile Include="Models\AuthState.cs" />
     <Compile Include="Models\LoginPackage.cs" />
     <Compile Include="Models\PlaybackAuthState.cs" />

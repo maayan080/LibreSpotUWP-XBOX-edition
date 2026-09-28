@@ -352,6 +352,19 @@
                 </Button>
 
                 <Button
+                    x:Name="NextDjSetButton"
+                    Height="40"
+                    Margin="0,0,20,0"
+                    Padding="10,0"
+                    Visibility="Collapsed"
+                    AutomationProperties.AutomationId="NextVibeButton"
+                    AutomationProperties.Name="Next vibe"
+                    ToolTipService.ToolTip="Skip to the next Spotify DJ vibe"
+                    Click="NextDjSetButton_Click">
+                    <TextBlock Text="Next vibe" />
+                </Button>
+
+                <Button
                     x:Name="RepeatButton"
                     Width="40"
                     Height="40"
