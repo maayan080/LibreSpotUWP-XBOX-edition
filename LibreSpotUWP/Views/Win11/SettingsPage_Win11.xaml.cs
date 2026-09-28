@@ -5,7 +5,6 @@ using LibreSpotUWP.Services;
 using System;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Windows.ApplicationModel.Core;
@@ -29,6 +28,7 @@ namespace LibreSpotUWP.Views.Win11
 
         protected bool _loading = true;
         protected bool _suppressAppearanceChange;
+        private bool _suppressAudioBackendChange;
 
         public SettingsPage_Win11()
         {
@@ -55,6 +55,8 @@ namespace LibreSpotUWP.Views.Win11
             ResumeLastPlaybackToggle.Visibility = resumeVisible;
             ResumeLastPlaybackDescription.Visibility = resumeVisible;
             RememberLastPageToggle.IsOn = UserSettings.RememberLastPage;
+            SelectAudioBackend(UserSettings.AudioBackend);
+            UpdateAudioBackendCapabilities();
             SelectAudioEffectsPreset(UserSettings.AudioEffectsPreset);
             EchoEffectToggle.IsOn = UserSettings.AudioEchoEffectEnabled;
             ReverbEffectToggle.IsOn = UserSettings.AudioReverbEffectEnabled;
@@ -246,6 +248,32 @@ namespace LibreSpotUWP.Views.Win11
             }
         }
 
+        private async void AudioBackendComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_loading || _suppressAudioBackendChange)
+                return;
+
+            var backend = GetSelectedAudioBackend();
+            AudioBackendComboBox.IsEnabled = false;
+            try
+            {
+                if (_media != null)
+                    await _media.SetAudioBackendAsync(backend);
+                else
+                    UserSettings.AudioBackend = backend;
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"Failed to switch audio backend to {backend}: {ex}");
+                SelectAudioBackend(UserSettings.AudioBackend);
+            }
+            finally
+            {
+                AudioBackendComboBox.IsEnabled = true;
+                UpdateAudioBackendCapabilities();
+            }
+        }
+
         private void AudioEffectToggle_Toggled(object sender, RoutedEventArgs e)
         {
             if (_loading)
@@ -296,6 +324,59 @@ namespace LibreSpotUWP.Views.Win11
             }
 
             AudioEffectsComboBox.SelectedIndex = 0;
+        }
+
+        private void SelectAudioBackend(AudioBackendKind backend)
+        {
+            _suppressAudioBackendChange = true;
+            foreach (var item in AudioBackendComboBox.Items.OfType<ComboBoxItem>())
+            {
+                if (Enum.TryParse(item.Tag as string, out AudioBackendKind itemBackend) && itemBackend == backend)
+                {
+                    AudioBackendComboBox.SelectedItem = item;
+                    _suppressAudioBackendChange = false;
+                    return;
+                }
+            }
+            AudioBackendComboBox.SelectedIndex = 0;
+            _suppressAudioBackendChange = false;
+        }
+
+        private AudioBackendKind GetSelectedAudioBackend()
+        {
+            var tag = (AudioBackendComboBox.SelectedItem as ComboBoxItem)?.Tag as string;
+            return Enum.TryParse(tag, out AudioBackendKind backend)
+                ? backend
+                : AudioBackendKind.RingBuffer;
+        }
+
+        private void UpdateAudioBackendCapabilities()
+        {
+            var backend = GetSelectedAudioBackend();
+            var supportsEffects = backend != AudioBackendKind.RustWasapi;
+            AudioEffectsComboBox.IsEnabled = supportsEffects;
+            EchoEffectToggle.IsEnabled = supportsEffects;
+            ReverbEffectToggle.IsEnabled = supportsEffects;
+            LimiterEffectToggle.IsEnabled = supportsEffects;
+            EffectStrengthSlider.IsEnabled = supportsEffects;
+            EqualizerLowSlider.IsEnabled = supportsEffects;
+            EqualizerLowMidSlider.IsEnabled = supportsEffects;
+            EqualizerMidSlider.IsEnabled = supportsEffects;
+            EqualizerHighMidSlider.IsEnabled = supportsEffects;
+            EqualizerHighSlider.IsEnabled = supportsEffects;
+
+            switch (backend)
+            {
+                case AudioBackendKind.RustWasapi:
+                    AudioBackendDescriptionText.Text = "Lowest-overhead Rust renderer. PCM is written directly to WASAPI; app audio effects are unavailable.";
+                    break;
+                case AudioBackendKind.RustXAudio2:
+                    AudioBackendDescriptionText.Text = "Rust-native XAudio2 renderer with live XAPO equalizer, echo, reverb, and limiter effects.";
+                    break;
+                default:
+                    AudioBackendDescriptionText.Text = "Compatibility renderer using the existing Rust PCM ring and managed AudioGraph effects.";
+                    break;
+            }
         }
 
         private void LoadAudioEffectSettings()
@@ -561,8 +642,8 @@ namespace LibreSpotUWP.Views.Win11
                         new Run { Text = "LibreSpot Commit: " },
                         new Hyperlink
                         {
-                            NavigateUri = new Uri("https://github.com/megabytesme/librespot/tree/06943a820f42b43da9abccea17a500d01ac8ac05"),
-                            Inlines = { new Run { Text = "06943a820f42b43da9abccea17a500d01ac8ac05" } }
+                            NavigateUri = new Uri("https://github.com/megabytesme/librespot/tree/2c58d7db09607105e17769ec41c210eff23a8333"),
+                            Inlines = { new Run { Text = "2c58d7db09607105e17769ec41c210eff23a8333" } }
                         },
                         new LineBreak(),
                         new LineBreak(),
@@ -701,54 +782,28 @@ namespace LibreSpotUWP.Views.Win11
 
         private async Task RefreshStorageStatusAsync()
         {
-            try
-            {
-                var persistedAudioPath = Path.Combine(ApplicationData.Current.LocalFolder.Path, "audio");
-                var cachedAudioPath = Path.Combine(ApplicationData.Current.LocalCacheFolder.Path, "audio");
+            var persistedTask = StorageStatisticsHelper.GetChildFolderStatsAsync(
+                ApplicationData.Current.LocalFolder,
+                "audio");
+            var cachedTask = StorageStatisticsHelper.GetChildFolderStatsAsync(
+                ApplicationData.Current.LocalCacheFolder,
+                "audio");
+            await Task.WhenAll(persistedTask, cachedTask);
+            var persistedStats = await persistedTask;
+            var cachedStats = await cachedTask;
 
-                var persistedStats = await Task.Run(() => GetStorageStats(persistedAudioPath));
-                var cachedStats = await Task.Run(() => GetStorageStats(cachedAudioPath));
-
-                await Dispatcher.RunAsync(
-                    Windows.UI.Core.CoreDispatcherPriority.Normal,
-                    () =>
-                    {
-                        PersistedStorageText.Text =
-                            $"Persisted audio: {FormatBytes(persistedStats.Bytes)} across {persistedStats.FileCount} song{(persistedStats.FileCount == 1 ? string.Empty : "s")}";
-                        CachedStorageText.Text =
-                            $"Cached audio: {FormatBytes(cachedStats.Bytes)} across {cachedStats.FileCount} song{(cachedStats.FileCount == 1 ? string.Empty : "s")}";
-                    });
-            }
-            catch (Exception ex)
-            {
-                LogService.Warn($"Failed to refresh storage status: {ex}");
-                PersistedStorageText.Text = "Persisted audio: Unavailable";
-                CachedStorageText.Text = "Cached audio: Unavailable";
-            }
+            PersistedStorageText.Text = FormatStorageStatus("Persisted", persistedStats);
+            CachedStorageText.Text = FormatStorageStatus("Cached", cachedStats);
         }
 
-        private static (long Bytes, int FileCount) GetStorageStats(string path)
+        private static string FormatStorageStatus(string label, StorageFolderStatistics statistics)
         {
-            if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
-                return (0, 0);
+            if (statistics == null || !statistics.IsAvailable)
+                return $"{label} audio: Unavailable";
 
-            long bytes = 0;
-            int count = 0;
-
-            foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
-            {
-                try
-                {
-                    var info = new FileInfo(file);
-                    bytes += info.Length;
-                    count++;
-                }
-                catch
-                {
-                }
-            }
-
-            return (bytes, count);
+            return
+                $"{label} audio: {FormatBytes(statistics.Bytes)} across {statistics.FileCount} " +
+                $"song{(statistics.FileCount == 1 ? string.Empty : "s")}";
         }
 
         private static string FormatBytes(long bytes)

@@ -1,6 +1,7 @@
 ﻿using LibreSpotUWP.Interfaces;
 using LibreSpotUWP.Models;
 using LibreSpotUWP.Helpers;
+using LibreSpotUWP.Services;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -17,10 +18,11 @@ namespace LibreSpotUWP.Controls
     public sealed partial class MediaControllerBar : UserControl
     {
         private IMediaService _media => App.Media;
-        private bool _draggingPosition = false;
+        private readonly PositionSeekInteraction _positionSeekInteraction = new PositionSeekInteraction();
         private bool _isReady = false;
         private string _currentArtworkUri = null;
         private bool _loadingOutputDevices;
+        private bool _changingOutputDevice;
         private bool _loadingSpotifyConnectDevices;
         private bool _spotifyConnectDropdownOpen;
         private bool _spotifyConnectRefreshPending;
@@ -29,8 +31,25 @@ namespace LibreSpotUWP.Controls
         public MediaControllerBar()
         {
             InitializeComponent();
+            RegisterPositionSliderHandlers();
             Loaded += MediaControllerBar_Loaded;
             Unloaded += MediaControllerBar_Unloaded;
+        }
+
+        private void RegisterPositionSliderHandlers()
+        {
+            PositionSlider.AddHandler(
+                UIElement.PointerPressedEvent,
+                new PointerEventHandler(PositionSlider_PointerPressed),
+                true);
+            PositionSlider.AddHandler(
+                UIElement.PointerReleasedEvent,
+                new PointerEventHandler(PositionSlider_PointerReleased),
+                true);
+            PositionSlider.AddHandler(
+                UIElement.PointerCaptureLostEvent,
+                new PointerEventHandler(PositionSlider_PointerCaptureLost),
+                true);
         }
 
         private void MediaControllerBar_Loaded(object sender, RoutedEventArgs e)
@@ -41,9 +60,7 @@ namespace LibreSpotUWP.Controls
             {
                 _mediaStateChangedHandler = (s, state) =>
                 {
-                    var ignored = Dispatcher.RunAsync(
-                        Windows.UI.Core.CoreDispatcherPriority.Normal,
-                        () => UpdateUI(state));
+                    UiWorkScheduler.RunLatest(this, Dispatcher, () => UpdateUI(state));
                 };
                 _media.MediaStateChanged += _mediaStateChangedHandler;
             }
@@ -81,13 +98,13 @@ namespace LibreSpotUWP.Controls
                 AlbumArt.Source = TryCreateBitmap(artworkUri);
             }
 
-            if (!_draggingPosition)
+            if (!_positionSeekInteraction.IsDragging)
             {
                 PositionSlider.Maximum = state.DurationMs;
                 PositionSlider.Value = state.PositionMs;
+                CurrentTime.Text = Format(state.PositionMs);
             }
 
-            CurrentTime.Text = Format(state.PositionMs);
             TotalTime.Text = Format(state.DurationMs);
 
             PlayPauseIcon.Glyph = state.IsPlaying ? "\uE769" : "\uE768";
@@ -167,7 +184,7 @@ namespace LibreSpotUWP.Controls
         }
 
         private void PositionSlider_PointerPressed(object sender, PointerRoutedEventArgs e)
-            => _draggingPosition = true;
+            => _positionSeekInteraction.BeginDrag();
 
         private void PositionSlider_PointerCaptureLost(object sender, PointerRoutedEventArgs e)
         {
@@ -181,17 +198,18 @@ namespace LibreSpotUWP.Controls
 
         private void PositionSlider_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
         {
-            if (_draggingPosition)
+            if (_positionSeekInteraction.IsDragging)
                 CurrentTime.Text = Format((uint)e.NewValue);
         }
 
         private void CommitPositionSeek()
         {
-            if (!_draggingPosition && PositionSlider == null)
+            if (PositionSlider == null)
                 return;
 
-            _draggingPosition = false;
-            _media?.Seek((uint)PositionSlider.Value);
+            uint positionMs;
+            if (_positionSeekInteraction.TryCommit((uint)PositionSlider.Value, out positionMs))
+                _media?.Seek(positionMs);
         }
 
         private void VolumeSlider_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
@@ -205,10 +223,11 @@ namespace LibreSpotUWP.Controls
 
         private async Task LoadOutputDevicesAsync()
         {
-            if (_media == null || OutputDeviceComboBox == null)
+            if (_media == null || OutputDeviceComboBox == null || _loadingOutputDevices)
                 return;
 
             _loadingOutputDevices = true;
+            OutputDeviceComboBox.IsEnabled = false;
             try
             {
                 var devices = await _media.GetAudioOutputDevicesAsync();
@@ -220,15 +239,31 @@ namespace LibreSpotUWP.Controls
             finally
             {
                 _loadingOutputDevices = false;
+                OutputDeviceComboBox.IsEnabled = !_changingOutputDevice;
             }
         }
 
         private async void OutputDeviceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_loadingOutputDevices || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || _media == null)
+            if (_loadingOutputDevices || _changingOutputDevice || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || _media == null)
                 return;
 
-            await _media.SetAudioOutputDeviceAsync(device.Id);
+            _changingOutputDevice = true;
+            OutputDeviceComboBox.IsEnabled = false;
+            try
+            {
+                await _media.SetAudioOutputDeviceAsync(device.Id);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaControllerBar.OutputDeviceComboBox_SelectionChanged] Unable to change audio output: {ex}");
+                await LoadOutputDevicesAsync();
+            }
+            finally
+            {
+                _changingOutputDevice = false;
+                OutputDeviceComboBox.IsEnabled = !_loadingOutputDevices;
+            }
         }
 
         private async Task LoadSpotifyConnectDevicesAsync()
@@ -395,14 +430,6 @@ namespace LibreSpotUWP.Controls
 
         private void UpdateArtistButton(MediaState state)
         {
-            if (state?.IsNarrationActive == true)
-            {
-                TrackArtistButton.Visibility = Visibility.Visible;
-                TrackArtistButton.IsEnabled = false;
-                ToolTipService.SetToolTip(TrackArtistButton, "Spotify");
-                return;
-            }
-
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = string.IsNullOrWhiteSpace(GetTrackArtist(state))
                 ? Visibility.Collapsed
@@ -415,12 +442,22 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackTitle(MediaState state)
         {
-            return FirstText(state?.DisplayTitle, "Unknown Track");
+            return FirstText(
+                state?.Metadata?.Name,
+                state?.Track?.Name,
+                "Unknown Track");
         }
 
         private static string GetTrackArtist(MediaState state)
         {
-            return FirstText(state?.DisplayArtist, "Unknown Artist");
+            var metadataArtists = state?.Metadata?.Artists?
+                .Select(artist => artist?.Name)
+                .Where(name => !string.IsNullOrWhiteSpace(name));
+
+            return FirstText(
+                metadataArtists == null ? null : string.Join(", ", metadataArtists),
+                state?.Track?.Artist,
+                "Unknown Artist");
         }
 
         private static string GetArtworkUri(MediaState state)

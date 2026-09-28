@@ -19,8 +19,10 @@ namespace LibreSpotUWP.Helpers
         private const string AudioReverbEffectEnabledKey = "AudioReverbEffectEnabled";
         private const string AudioLimiterEffectEnabledKey = "AudioLimiterEffectEnabled";
         private const string AudioOutputDeviceIdKey = "AudioOutputDeviceId";
+        private const string AudioBackendKey = "AudioBackend";
         private const string SpotifyConnectDeviceIdKey = "SpotifyConnectDeviceId";
         private const string SpotifyCustomClientIdKey = "SpotifyCustomClientId";
+        private const string HideAudioKeyCompatibilityWarningKey = "HideAudioKeyCompatibilityWarning";
         private const string EqualizerBandsKey = "AudioEffectsEqualizerBands";
         private const string EqualizerBandsUnitKey = "AudioEffectsEqualizerBandsUnit";
         private const string EqualizerBandsUnitDb = "Db";
@@ -142,6 +144,31 @@ namespace LibreSpotUWP.Helpers
             set => ApplicationData.Current.LocalSettings.Values[AudioOutputDeviceIdKey] = value ?? string.Empty;
         }
 
+        public static AudioBackendKind AudioBackend
+        {
+            get
+            {
+                if (ApplicationData.Current.LocalSettings.Values.TryGetValue(AudioBackendKey, out object value) &&
+                    value is int stored &&
+                    Enum.IsDefined(typeof(AudioBackendKind), stored))
+                {
+                    return (AudioBackendKind)stored;
+                }
+
+                // New installations and upgrades from versions that did not
+                // persist an audio backend start on the native effects path.
+                // An explicitly saved RingBuffer choice is still preserved.
+                return AudioBackendKind.RustXAudio2;
+            }
+            set
+            {
+                var normalized = Enum.IsDefined(typeof(AudioBackendKind), value)
+                    ? value
+                    : AudioBackendKind.RustXAudio2;
+                ApplicationData.Current.LocalSettings.Values[AudioBackendKey] = (int)normalized;
+            }
+        }
+
         public static string SpotifyConnectDeviceId
         {
             get => ApplicationData.Current.LocalSettings.Values.TryGetValue(SpotifyConnectDeviceIdKey, out object value) ? value as string : string.Empty;
@@ -156,6 +183,12 @@ namespace LibreSpotUWP.Helpers
 
         public static bool HasSpotifyCustomClientId =>
             !string.IsNullOrWhiteSpace(SpotifyCustomClientId);
+
+        public static bool HideAudioKeyCompatibilityWarning
+        {
+            get => GetBoolSetting(HideAudioKeyCompatibilityWarningKey, defaultValue: false);
+            set => ApplicationData.Current.LocalSettings.Values[HideAudioKeyCompatibilityWarningKey] = value;
+        }
 
         public static bool RememberLastPlaybackState
         {

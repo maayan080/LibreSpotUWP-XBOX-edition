@@ -1,5 +1,6 @@
 ﻿using LibreSpotUWP.Models;
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace LibreSpotUWP.Interfaces
@@ -38,14 +39,15 @@ namespace LibreSpotUWP.Interfaces
     {
         Task InitializeAsync();
         LibrespotSessionState Session { get; }
+        long SessionGeneration { get; }
         LibrespotPlaybackState PlaybackState { get; }
         LibrespotTrackInfo CurrentTrack { get; }
         ushort Volume { get; }
         string DeviceId { get; }
         string DeviceName { get; }
 
-        Task ConnectWithAccessTokenAsync(string accessToken);
-        Task ReconnectWithAccessTokenAsync(string accessToken);
+        Task ConnectWithPlaybackAuthAsync(PlaybackConnectionMaterial authorization);
+        Task ReconnectWithPlaybackAuthAsync(PlaybackConnectionMaterial authorization);
         Task DisconnectAsync();
         Task<LibrespotTrackData> GetTrackAsync(string trackUri);
         Task<LibrespotAlbumData> GetAlbumAsync(string albumUri);
@@ -58,7 +60,11 @@ namespace LibreSpotUWP.Interfaces
         Task<LibrespotLyricsData> GetLyricsAsync(string trackUri, string imageIdHex = null);
         Task<string> GetLyricsJsonAsync(string trackUri, string imageIdHex = null);
         Task<LibrespotSearchData> SearchAsync(string query);
-        Task LoadAndPlayAsync(string spotifyUri, string startUri);
+        Task LoadAndPlayAsync(
+            string spotifyUri,
+            string startUri,
+            IReadOnlyList<string> orderedTrackUris = null,
+            bool startPlaying = true);
         Task SetTrackPersistedAsync(string trackUri, bool persisted);
         Task PauseAsync();
         Task ResumeAsync();
@@ -75,15 +81,20 @@ namespace LibreSpotUWP.Interfaces
 
         event EventHandler<LibrespotSessionState> SessionStateChanged;
         event EventHandler<LibrespotTrackInfo> TrackChanged;
-        event EventHandler<LibrespotNarrationState> NarrationChanged;
         event EventHandler<LibrespotPlaybackState> PlaybackStateChanged;
-        event EventHandler<uint> PositionChanged;
+        event EventHandler<LibrespotPlaybackEvent> PlaybackEvent;
+        event EventHandler<LibrespotPositionUpdate> PositionChanged;
         event EventHandler<ushort> VolumeChanged;
         event EventHandler<bool> ShuffleChanged;
         event EventHandler<uint> RepeatChanged;
-        event EventHandler<string> EndOfTrack;
+        event EventHandler<LibrespotTrackBoundaryInfo> EndOfTrack;
+        event EventHandler<LibrespotTrackBoundaryInfo> TimeToPreloadNextTrack;
+        event EventHandler<LibrespotTrackBoundaryInfo> TrackPreloading;
         event EventHandler<string> LogMessage;
         event EventHandler<string> Panic;
+        event EventHandler<PlaybackCredentialsEventArgs> PlaybackCredentialsAvailable;
+        event EventHandler PlaybackAuthorizationRejected;
+        event EventHandler PlaybackAccountUnsupported;
     }
 
 }

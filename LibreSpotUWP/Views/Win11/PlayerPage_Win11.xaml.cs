@@ -2,6 +2,7 @@ using LibreSpotUWP.Controls;
 using LibreSpotUWP.Interfaces;
 using LibreSpotUWP.Models;
 using LibreSpotUWP.Helpers;
+using LibreSpotUWP.Services;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -20,13 +21,14 @@ namespace LibreSpotUWP.Views.Win11
     {
         private IMediaService Media => App.Media;
 
-        private bool _dragging = false;
+        private readonly PositionSeekInteraction _positionSeekInteraction = new PositionSeekInteraction();
         private string _currentTrackUri = null;
         private string _currentArtworkUri = null;
         private uint _lastUpdateSec = uint.MaxValue;
         private DataTransferManager _dataTransferManager;
         private NowPlayingLyricsPresenter _lyricsPresenter;
         private bool _loadingOutputDevices;
+        private bool _changingOutputDevice;
         private bool _loadingSpotifyConnectDevices;
         private bool _spotifyConnectDropdownOpen;
         private bool _spotifyConnectRefreshPending;
@@ -34,9 +36,26 @@ namespace LibreSpotUWP.Views.Win11
         public PlayerPage_Win11()
         {
             this.InitializeComponent();
+            RegisterPositionSliderHandlers();
             _lyricsPresenter = new NowPlayingLyricsPresenter(CurrentLyricPreview, CurrentLyricText);
             this.Loaded += PlayerPage_Loaded;
             this.Unloaded += PlayerPage_Unloaded;
+        }
+
+        private void RegisterPositionSliderHandlers()
+        {
+            PositionSlider.AddHandler(
+                UIElement.PointerPressedEvent,
+                new PointerEventHandler(PositionSlider_PointerPressed),
+                true);
+            PositionSlider.AddHandler(
+                UIElement.PointerReleasedEvent,
+                new PointerEventHandler(PositionSlider_PointerReleased),
+                true);
+            PositionSlider.AddHandler(
+                UIElement.PointerCaptureLostEvent,
+                new PointerEventHandler(PositionSlider_PointerCaptureLost),
+                true);
         }
 
         private void PlayerPage_Loaded(object sender, RoutedEventArgs e)
@@ -80,9 +99,7 @@ namespace LibreSpotUWP.Views.Win11
 
         private void OnMediaStateChanged(object sender, MediaState state)
         {
-            var ignore = Dispatcher.RunAsync(
-                Windows.UI.Core.CoreDispatcherPriority.Normal,
-                () => UpdateUI(state));
+            UiWorkScheduler.RunLatest(this, Dispatcher, () => UpdateUI(state));
         }
 
         private void UpdateUI(MediaState state)
@@ -92,12 +109,12 @@ namespace LibreSpotUWP.Views.Win11
             if (state.Track?.Uri != _currentTrackUri)
             {
                 _currentTrackUri = state.Track?.Uri;
+
+                TrackTitle.Text = state.Track?.Name ?? "";
+                TrackArtist.Text = state.Track?.Artist ?? "";
                 TotalTime.Text = Format(state.DurationMs);
 
             }
-
-            TrackTitle.Text = state.DisplayTitle;
-            TrackArtist.Text = state.DisplayArtist;
 
             UpdateArtistButton(state);
             UpdateContextButton(state);
@@ -128,20 +145,16 @@ namespace LibreSpotUWP.Views.Win11
             UpdateSpotifyConnectSelection(state);
 
             uint currentSec = state.PositionMs / 1000;
-            if (currentSec != _lastUpdateSec || _dragging)
+            if (currentSec != _lastUpdateSec && !_positionSeekInteraction.IsDragging)
             {
                 _lastUpdateSec = currentSec;
 
-                if (!_dragging)
+                if (PositionSlider.Maximum != state.DurationMs)
                 {
-                    if (PositionSlider.Maximum != state.DurationMs)
-                    {
-                        PositionSlider.Maximum = state.DurationMs;
-                    }
-
-                    PositionSlider.Value = state.PositionMs;
+                    PositionSlider.Maximum = state.DurationMs;
                 }
 
+                PositionSlider.Value = state.PositionMs;
                 ElapsedTime.Text = Format(state.PositionMs);
             }
         }
@@ -156,7 +169,7 @@ namespace LibreSpotUWP.Views.Win11
 
         private void PositionSlider_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
-            _dragging = true;
+            _positionSeekInteraction.BeginDrag();
         }
 
         private void PositionSlider_PointerCaptureLost(object sender, PointerRoutedEventArgs e)
@@ -171,7 +184,7 @@ namespace LibreSpotUWP.Views.Win11
 
         private void PositionSlider_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
         {
-            if (_dragging)
+            if (_positionSeekInteraction.IsDragging)
             {
                 ElapsedTime.Text = Format((uint)e.NewValue);
             }
@@ -182,8 +195,9 @@ namespace LibreSpotUWP.Views.Win11
             if (PositionSlider == null)
                 return;
 
-            _dragging = false;
-            Media.Seek((uint)PositionSlider.Value);
+            uint positionMs;
+            if (_positionSeekInteraction.TryCommit((uint)PositionSlider.Value, out positionMs))
+                Media.Seek(positionMs);
         }
 
         private void PrevButton_Click(object sender, RoutedEventArgs e)
@@ -289,10 +303,11 @@ namespace LibreSpotUWP.Views.Win11
 
         private async Task LoadOutputDevicesAsync()
         {
-            if (Media == null || OutputDeviceComboBox == null)
+            if (Media == null || OutputDeviceComboBox == null || _loadingOutputDevices)
                 return;
 
             _loadingOutputDevices = true;
+            OutputDeviceComboBox.IsEnabled = false;
             try
             {
                 var devices = await Media.GetAudioOutputDevicesAsync();
@@ -304,15 +319,31 @@ namespace LibreSpotUWP.Views.Win11
             finally
             {
                 _loadingOutputDevices = false;
+                OutputDeviceComboBox.IsEnabled = !_changingOutputDevice;
             }
         }
 
         private async void OutputDeviceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_loadingOutputDevices || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || Media == null)
+            if (_loadingOutputDevices || _changingOutputDevice || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || Media == null)
                 return;
 
-            await Media.SetAudioOutputDeviceAsync(device.Id);
+            _changingOutputDevice = true;
+            OutputDeviceComboBox.IsEnabled = false;
+            try
+            {
+                await Media.SetAudioOutputDeviceAsync(device.Id);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[PlayerPage_Win11.OutputDeviceComboBox_SelectionChanged] Unable to change audio output: {ex}");
+                await LoadOutputDevicesAsync();
+            }
+            finally
+            {
+                _changingOutputDevice = false;
+                OutputDeviceComboBox.IsEnabled = !_loadingOutputDevices;
+            }
         }
 
         private async Task LoadSpotifyConnectDevicesAsync()
@@ -519,14 +550,6 @@ namespace LibreSpotUWP.Views.Win11
 
         private void UpdateArtistButton(MediaState state)
         {
-            if (state?.IsNarrationActive == true)
-            {
-                TrackArtistButton.Visibility = Visibility.Visible;
-                TrackArtistButton.IsEnabled = false;
-                ToolTipService.SetToolTip(TrackArtistButton, "Spotify");
-                return;
-            }
-
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = artists.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
             TrackArtistButton.IsEnabled = artists.Count > 0;
@@ -566,14 +589,12 @@ namespace LibreSpotUWP.Views.Win11
             return new List<AppSimpleArtist>();
         }
 
-        private async void Downloads_TrackStatusChanged(object sender, TrackDownloadStatus e)
+        private void Downloads_TrackStatusChanged(object sender, TrackDownloadStatus e)
         {
             if (Media?.Current?.Track?.Uri != e?.TrackUri)
                 return;
 
-            await Dispatcher.RunAsync(
-                Windows.UI.Core.CoreDispatcherPriority.Normal,
-                () => UpdateUI(Media.Current));
+            UiWorkScheduler.RunLatest(this, Dispatcher, () => UpdateUI(Media.Current));
         }
     }
 }

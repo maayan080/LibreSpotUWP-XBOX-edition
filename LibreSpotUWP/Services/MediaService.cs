@@ -20,21 +20,31 @@ using Windows.Media.Playback;
 using Windows.Networking.Connectivity;
 using Windows.Storage;
 using Windows.Storage.Streams;
+using Windows.UI.Core;
 using Windows.UI.Xaml;
 using static LibreSpotUWP.Interop.Librespot;
 
 namespace LibreSpotUWP.Services
 {
-    public sealed class MediaService : IMediaService
+    public sealed class MediaService : IMediaService, IDisposable
     {
         private readonly ILibrespotService _librespot;
         private readonly ISpotifyAuthService _auth;
+        private readonly ISpotifyPlaybackAuthService _playbackAuth;
         private readonly ISpotifyWebService _web;
 
         private readonly object _lock = new object();
         private readonly object _spotifyConnectRefreshScheduleLock = new object();
         private readonly SemaphoreSlim _playbackGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _ringPlayerGate = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _audioConfigurationGate = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _networkStatusGate = new SemaphoreSlim(1, 1);
+        private readonly AsyncOperationOnce _initialization = new AsyncOperationOnce();
+        private readonly RecoveryOperationGate _producerRecovery = new RecoveryOperationGate();
+        private readonly ApplicationPlaybackQueue _applicationQueue = new ApplicationPlaybackQueue();
+        private readonly SpotifyConnectTransferTracker _spotifyConnectTransfer =
+            new SpotifyConnectTransferTracker(TimeSpan.FromSeconds(15));
+        private readonly CancellationTokenSource _lifetimeCancellation = new CancellationTokenSource();
         private readonly Random _random = new Random();
         private readonly HashSet<string> _offlinePlaybackFailedTrackUris = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -60,18 +70,21 @@ namespace LibreSpotUWP.Services
         private MediaPlayer _mediaPlayer;
         private SystemMediaTransportControls _smtc;
 
-        private LibrespotRingBufferPlayer _ringPlayer;
+        private ILibrespotAudioPlayer _ringPlayer;
 
         private DispatcherTimer _positionTimer;
+        private readonly PlaybackPositionSynchronizer _positionSynchronizer = new PlaybackPositionSynchronizer();
         private DispatcherTimer _volumeDebounceTimer;
         private DispatcherTimer _spotifyConnectTimer;
-        private ushort _pendingVolume;
-        private bool _volumeDirty = false;
+        private int _pendingVolume;
+        private int _volumeDirty;
+        private int _volumeVersion;
+        private int _volumeAppliedVersion;
+        private int _volumeUpdateRunning;
         private bool _refreshingSpotifyConnectPlayback;
         private int _spotifyConnectRefreshFailureCount;
         private DateTimeOffset _nextSpotifyConnectRefreshAt = DateTimeOffset.MinValue;
-        private uint _remotePositionBaseMs;
-        private DateTimeOffset _remotePositionUpdatedAt = DateTimeOffset.MinValue;
+        private bool _hasRemotePositionAnchor;
         private string[] _offlineQueue = Array.Empty<string>();
         private int _offlineQueueIndex = -1;
         private string _offlineQueueContextUri;
@@ -80,10 +93,9 @@ namespace LibreSpotUWP.Services
         private bool _currentOfflineFallbackIsRandom;
         private int _contextResolutionVersion;
         private int _trackChangeVersion;
-        private int _playbackContinuationVersion;
+        private int _metadataRefreshVersion;
         private int _offlineStopRecoveryVersion;
         private int _connectivityRecheckVersion;
-        private int _pendingEndOfTrackContinuationVersion;
         private int _offlineLoadVersion;
         private int _downloadedPlaybackRecoveryInProgress;
         private bool _waitingForOnlineQueueContinuation;
@@ -95,23 +107,35 @@ namespace LibreSpotUWP.Services
         private string _onlineQueueRecoveryContextUri;
         private string _onlineQueueRecoveryStartUri;
         private bool _librespotTransportUnhealthy;
+        private int _producerRecoveryBlocked;
+        private int _suspended;
+        private int _disposed;
+        private int _playbackRequested;
+        private long _applicationQueueSessionGeneration;
         private string _pendingOfflineLoadTrackUri;
         private PlaybackTransportMode _transportMode = PlaybackTransportMode.None;
         private PlaybackIntent _playbackIntent;
         private PlaybackSnapshot _lastPlaybackSnapshot;
+        private bool _restoredSnapshotPendingResume;
         private uint _lastPersistedSnapshotPositionMs = uint.MaxValue;
         private uint _pendingRestoreSeekMs = uint.MaxValue;
+        private string _pendingRestoreTrackUri;
         private DateTimeOffset _lastSnapshotWriteAt = DateTimeOffset.MinValue;
+        private readonly LatestWorkCoalescer _snapshotWriteQueue = new LatestWorkCoalescer(
+            action => { var ignored = Task.Run(action); });
 
         public MediaState Current => _state;
         public event EventHandler<MediaState> MediaStateChanged;
 
         private const string VolumeKey = "UserVolume";
         private const string PlaybackSnapshotKey = "LastPlaybackSnapshot";
-        private const int PositionTimerIntervalMs = 500;
+        private const int PositionTimerIntervalMs = PlaybackPositionSynchronizer.UiUpdateIntervalMs;
         private const int SnapshotWriteIntervalMs = 5000;
         private const int MaxOnlineQueueRecoveryAttempts = 2;
+        private const int MaxProducerRecoveryAttempts = 3;
         private static readonly TimeSpan OnlineQueueRecoveryWatchdogDelay = TimeSpan.FromSeconds(12);
+        private static readonly TimeSpan ProducerRecoveryVerificationTimeout = TimeSpan.FromSeconds(12);
+        private static readonly TimeSpan EndOfQueueGracePeriod = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan LocalSessionConnectTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan OfflineLoadStopValidationDelay = TimeSpan.FromMilliseconds(1200);
         private static readonly TimeSpan MediaFailureInternetBackoff = TimeSpan.FromSeconds(60);
@@ -119,6 +143,7 @@ namespace LibreSpotUWP.Services
         private const string AppDataLocalUriPrefix = "ms-appdata:///local/";
 
         public string CurrentAudioOutputDeviceId => UserSettings.AudioOutputDeviceId;
+        public AudioBackendKind CurrentAudioBackend => UserSettings.AudioBackend;
         public string CurrentSpotifyConnectDeviceId => GetSelectedSpotifyConnectDeviceId();
 
         private sealed class PlaybackSnapshot
@@ -140,14 +165,24 @@ namespace LibreSpotUWP.Services
         public MediaService(
             ILibrespotService librespot,
             ISpotifyAuthService auth,
+            ISpotifyPlaybackAuthService playbackAuth,
             ISpotifyWebService web)
         {
             _librespot = librespot;
             _auth = auth;
+            _playbackAuth = playbackAuth;
             _web = web;
         }
 
-        public async Task InitializeAsync()
+        public Task InitializeAsync()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                throw new ObjectDisposedException(nameof(MediaService));
+
+            return _initialization.Run(InitializeCoreAsync);
+        }
+
+        private async Task InitializeCoreAsync()
         {
             _mediaPlayer = new MediaPlayer();
             _mediaPlayer.AutoPlay = false;
@@ -176,6 +211,11 @@ namespace LibreSpotUWP.Services
             commandManager.PauseBehavior.EnablingRule = MediaCommandEnablingRule.Always;
             commandManager.NextBehavior.EnablingRule = MediaCommandEnablingRule.Always;
             commandManager.PreviousBehavior.EnablingRule = MediaCommandEnablingRule.Always;
+            commandManager.ShuffleBehavior.EnablingRule = MediaCommandEnablingRule.Always;
+            commandManager.AutoRepeatModeBehavior.EnablingRule = MediaCommandEnablingRule.Always;
+
+            commandManager.ShuffleReceived += OnSmtcShuffleReceived;
+            commandManager.AutoRepeatModeReceived += OnSmtcAutoRepeatModeReceived;
 
             _smtc = _mediaPlayer.SystemMediaTransportControls;
             _smtc.IsPlayEnabled = true;
@@ -187,21 +227,24 @@ namespace LibreSpotUWP.Services
             _smtc.ButtonPressed += OnSmtcButtonPressed;
 
             _librespot.TrackChanged += OnTrackChanged;
-            _librespot.NarrationChanged += OnNarrationChanged;
-            _librespot.PlaybackStateChanged += OnPlaybackChanged;
+            _librespot.PlaybackEvent += OnPlaybackChanged;
             _librespot.PositionChanged += OnPositionChanged;
             _librespot.SessionStateChanged += OnSessionStateChanged;
             _librespot.VolumeChanged += OnVolumeChanged;
             _librespot.ShuffleChanged += OnShuffleChanged;
             _librespot.RepeatChanged += OnRepeatChanged;
             _librespot.EndOfTrack += OnEndOfTrack;
+            _librespot.TimeToPreloadNextTrack += OnTimeToPreloadNextTrack;
+            _librespot.TrackPreloading += OnTrackPreloading;
             _librespot.LogMessage += OnLibrespotLogMessage;
-
-            _auth.AuthStateChanged += OnAuthChanged;
+            _librespot.PlaybackCredentialsAvailable += OnPlaybackCredentialsAvailable;
+            _librespot.PlaybackAuthorizationRejected += OnPlaybackAuthorizationRejected;
+            _librespot.PlaybackAccountUnsupported += OnPlaybackAccountUnsupported;
+            _playbackAuth.PlaybackAuthStateChanged += OnPlaybackAuthChanged;
 
             _mediaPlayer.Source = CreateSilentMediaSource();
             await RestorePlaybackSnapshotAsync();
-            await PrewarmRingPlayerAsync();
+            _ = PrewarmRingPlayerAsync();
 
             _positionTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(PositionTimerIntervalMs) };
             _positionTimer.Tick += PositionTimer_Tick;
@@ -236,13 +279,47 @@ namespace LibreSpotUWP.Services
             if (!IsSelectedSpotifyConnectDeviceLocal)
             {
                 UpdateEstimatedRemotePosition();
-                return;
+            }
+            else
+            {
+                var isPlaying = _state.PlaybackState == LibrespotPlaybackState.Playing;
+                if (isPlaying)
+                {
+                    _positionSynchronizer.ObserveAuthoritative(
+                        _librespot.GetPositionMs(),
+                        PlaybackPositionOrigin.PeriodicPoll,
+                        isPlaying: true);
+                }
+
+                PublishSynchronizedPosition(persistSnapshot: isPlaying);
             }
 
-            if (_state.PlaybackState != LibrespotPlaybackState.Playing)
+            FlushPositionCorrectionBurstSummary();
+        }
+
+        private void PublishSynchronizedPosition(bool persistSnapshot)
+        {
+            uint visiblePosition;
+            if (_positionSynchronizer.TryGetVisiblePosition(
+                _state.DurationMs,
+                _state.PlaybackState == LibrespotPlaybackState.Playing,
+                force: false,
+                positionMs: out visiblePosition))
+            {
+                ApplyPlaybackPosition(visiblePosition, persistSnapshot);
+            }
+        }
+
+        private void FlushPositionCorrectionBurstSummary()
+        {
+            PositionCorrectionBurstSummary summary;
+            if (!_positionSynchronizer.TryTakeCorrectionBurstSummary(out summary))
                 return;
 
-            ApplyPlaybackPosition(_librespot.GetPositionMs(), persistSnapshot: true);
+            LogService.Info(
+                $"[MediaService.PositionSync] Correction burst count={summary.Count}, " +
+                $"durationMs={summary.DurationMs}, maxDriftMs={summary.MaximumDriftMs}, " +
+                $"hardCorrections={summary.HardCorrections}, actualSeeks={summary.ActualSeeksIssued}.");
         }
 
         private void SpotifyConnectTimer_Tick(object sender, object e)
@@ -303,6 +380,44 @@ namespace LibreSpotUWP.Services
                 : positionMs;
         }
 
+        private void SetPendingRestoreSeek(uint positionMs, string trackUri)
+        {
+            lock (_lock)
+            {
+                _pendingRestoreSeekMs = positionMs;
+                _pendingRestoreTrackUri = trackUri;
+            }
+        }
+
+        private bool HasPendingRestoreSeekFor(string trackUri)
+        {
+            lock (_lock)
+            {
+                return _pendingRestoreSeekMs != uint.MaxValue &&
+                    (string.IsNullOrWhiteSpace(_pendingRestoreTrackUri) ||
+                     string.Equals(_pendingRestoreTrackUri, trackUri, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        private bool TryTakePendingRestoreSeek(string trackUri, out uint positionMs)
+        {
+            lock (_lock)
+            {
+                if (_pendingRestoreSeekMs == uint.MaxValue ||
+                    (!string.IsNullOrWhiteSpace(_pendingRestoreTrackUri) &&
+                     !string.Equals(_pendingRestoreTrackUri, trackUri, StringComparison.OrdinalIgnoreCase)))
+                {
+                    positionMs = 0;
+                    return false;
+                }
+
+                positionMs = _pendingRestoreSeekMs;
+                _pendingRestoreSeekMs = uint.MaxValue;
+                _pendingRestoreTrackUri = null;
+                return true;
+            }
+        }
+
         private string LocalSpotifyConnectDeviceId => _librespot?.DeviceId ?? string.Empty;
 
         private bool IsSelectedSpotifyConnectDeviceLocal => IsLocalSpotifyConnectDeviceId(GetSelectedSpotifyConnectDeviceId());
@@ -333,6 +448,27 @@ namespace LibreSpotUWP.Services
             });
         }
 
+        private void AdoptLocalSpotifyConnectSession()
+        {
+            var localDeviceId = LocalSpotifyConnectDeviceId;
+            if (string.IsNullOrWhiteSpace(localDeviceId))
+                return;
+
+            _spotifyConnectTransfer.Cancel();
+            _hasRemotePositionAnchor = false;
+            UserSettings.SpotifyConnectDeviceId = localDeviceId;
+            UpdateSelectedSpotifyConnectDeviceState(new SpotifyConnectDeviceInfo
+            {
+                Id = localDeviceId,
+                Name = "This device",
+                Type = "Computer",
+                IsActive = true,
+                IsThisDevice = true,
+                SupportsVolume = true,
+                VolumePercent = (int)Math.Round(Current.Volume * 100.0 / 65535.0)
+            });
+        }
+
         private static bool IsSpotifyConnectDeviceNotFound(Exception ex)
         {
             if (ex is SpotifyWebException webEx && webEx.StatusCode == 404)
@@ -356,8 +492,9 @@ namespace LibreSpotUWP.Services
 
             LogService.Warn($"[MediaService.{operation}] Spotify Connect device '{missingDeviceId}' is no longer available. Falling back to this device.");
 
+            _spotifyConnectTransfer.Cancel();
             UserSettings.SpotifyConnectDeviceId = LocalSpotifyConnectDeviceId;
-            _remotePositionUpdatedAt = DateTimeOffset.MinValue;
+            _hasRemotePositionAnchor = false;
 
             UpdateSelectedSpotifyConnectDeviceState(new SpotifyConnectDeviceInfo
             {
@@ -453,62 +590,103 @@ namespace LibreSpotUWP.Services
         public async Task SetSpotifyConnectDeviceAsync(string deviceId)
         {
             deviceId = string.IsNullOrWhiteSpace(deviceId) ? LocalSpotifyConnectDeviceId : deviceId;
-            if (string.Equals(GetSelectedSpotifyConnectDeviceId(), deviceId, StringComparison.OrdinalIgnoreCase))
+            var previousDeviceId = GetSelectedSpotifyConnectDeviceId();
+            if (string.Equals(previousDeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
                 return;
 
+            CancelPlaybackContinuationWatchdog();
             var devices = await GetSpotifyConnectDevicesAsync().ConfigureAwait(false);
             var selected = devices.FirstOrDefault(device => string.Equals(device.Id, deviceId, StringComparison.OrdinalIgnoreCase));
             var wasPlaying = Current.PlaybackState == LibrespotPlaybackState.Playing;
             var hadPlayback = Current.Track != null || wasPlaying || Current.PlaybackState == LibrespotPlaybackState.Paused;
-            var transferPositionMs = ClampPlaybackPosition(Current.PositionMs);
+            var hasInternetAccess = ConnectivityHelper.HasInternetAccess();
+            if (hasInternetAccess && hadPlayback)
+                _spotifyConnectTransfer.Begin(deviceId, DateTimeOffset.UtcNow);
+
             UserSettings.SpotifyConnectDeviceId = deviceId;
             UpdateSelectedSpotifyConnectDeviceState(selected);
 
-            if (!ConnectivityHelper.HasInternetAccess())
+            if (!hasInternetAccess)
                 return;
 
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
             try
             {
                 if (IsLocalSpotifyConnectDeviceId(deviceId))
                     await EnsureLocalLibrespotConnectedAsync(interactive: false).ConfigureAwait(false);
 
                 if (hadPlayback)
-                {
                     await _web.TransferPlaybackAsync(deviceId, wasPlaying).ConfigureAwait(false);
 
-                    if (!IsLocalSpotifyConnectDeviceId(deviceId) && transferPositionMs > 0)
-                    {
-                        try
-                        {
-                            await Task.Delay(250).ConfigureAwait(false);
-                            await _web.SeekToAsync(deviceId, transferPositionMs).ConfigureAwait(false);
-                        }
-                        catch (Exception seekEx)
-                        {
-                            LogService.Warn($"[MediaService.SetSpotifyConnectDeviceAsync] Unable to restore Connect playback position: {seekEx.Message}");
-                        }
-                    }
-                }
-
-                if (!IsLocalSpotifyConnectDeviceId(deviceId))
+                if (hadPlayback)
                     await RefreshSpotifyConnectPlaybackAsync(force: true).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
+                _spotifyConnectTransfer.Cancel();
                 if (await TryRecoverMissingSpotifyConnectDeviceAsync(ex, nameof(SetSpotifyConnectDeviceAsync)).ConfigureAwait(false))
                     return;
 
+                UserSettings.SpotifyConnectDeviceId = previousDeviceId;
+                UpdateSelectedSpotifyConnectDeviceState(
+                    devices.FirstOrDefault(device => string.Equals(device.Id, previousDeviceId, StringComparison.OrdinalIgnoreCase)));
                 LogService.Warn($"[MediaService.SetSpotifyConnectDeviceAsync] Unable to transfer playback to {selected?.Name ?? deviceId}: {ex.Message}");
+            }
+            finally
+            {
+                _playbackGate.Release();
             }
         }
 
-        public async Task PlayAsync(string contextUri, string startUri = null)
+        public Task PlayAsync(string contextUri, string startUri = null)
         {
+            return PlayAsync(contextUri, startUri, null, -1);
+        }
+
+        public async Task PlayAsync(
+            string contextUri,
+            string startUri,
+            IReadOnlyList<string> orderedTrackUris,
+            int startIndex)
+        {
+            Volatile.Write(ref _playbackRequested, 1);
+            CancelProducerRecovery(resetAttemptBudget: true);
             CancelPlaybackContinuationWatchdog();
             await _playbackGate.WaitAsync();
             try
             {
-                await PlayCoreAsync(contextUri, startUri);
+                // Any explicit selection supersedes the startup-only snapshot
+                // resume path, even if the new native load has not reported its
+                // TrackChanged marker yet.
+                _restoredSnapshotPendingResume = false;
+
+                var initialTrackUri = FirstNonBlank(
+                    startUri,
+                    IsSpotifyTrackUri(contextUri) ? contextUri : null,
+                    orderedTrackUris?.FirstOrDefault());
+                IReadOnlyList<string> queueUris = orderedTrackUris;
+                if ((queueUris == null || queueUris.Count == 0) &&
+                    !string.IsNullOrWhiteSpace(initialTrackUri))
+                {
+                    queueUris = new[] { initialTrackUri };
+                    startIndex = 0;
+                }
+
+                var generation = _applicationQueue.Replace(
+                    GetPlaybackContextUri(contextUri, startUri),
+                    queueUris,
+                    initialTrackUri,
+                    startIndex,
+                    Current.Shuffle,
+                    Current.RepeatMode);
+                LogService.Info($"[MediaService.PlayAsync] Application queue generation={generation}, context={contextUri ?? "(null)"}, tracks={queueUris?.Count ?? 0}, startIndex={_applicationQueue.Snapshot.CurrentIndex}.");
+                await PlayCoreAsync(contextUri, startUri, orderedTrackUris: queueUris);
+                ScheduleApplicationQueueHydration(
+                    generation,
+                    contextUri,
+                    initialTrackUri,
+                    startIndex,
+                    queueUris?.Count ?? 0);
             }
             finally
             {
@@ -561,7 +739,11 @@ namespace LibreSpotUWP.Services
             _transportMode = mode;
         }
 
-        private async Task PlayCoreAsync(string contextUri, string startUri = null, bool isOnlineQueueRecovery = false)
+        private async Task PlayCoreAsync(
+            string contextUri,
+            string startUri = null,
+            bool isOnlineQueueRecovery = false,
+            IReadOnlyList<string> orderedTrackUris = null)
         {
             _waitingForOnlineQueueContinuation = false;
 
@@ -729,16 +911,22 @@ namespace LibreSpotUWP.Services
             _ = ResolveAndApplyContextNameAsync(playbackContextUri, Interlocked.Increment(ref _contextResolutionVersion));
 
             LogService.Info($"[MediaService.PlayAsync] Loading context={contextUri}, start={startUri ?? "(null)"}, offline={isOffline}.");
-            _ringPlayer?.Stop();
+            await EnsureRingPlayerAsync();
+            _ringPlayer.BeginTransition(
+                isOnlineQueueRecovery ? "reconnect-load" : "load",
+                Current.Track?.Uri,
+                startUri ?? (IsSpotifyTrackUri(contextUri) ? contextUri : null),
+                preserveCurrent: false,
+                shouldPlay: true);
+            UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Loading);
             if (_mediaPlayer.PlaybackSession.PlaybackState == MediaPlaybackState.Playing)
                 _mediaPlayer.Pause();
             ApplyPlaybackPosition(0, persistSnapshot: false);
 
-            await _librespot.LoadAndPlayAsync(contextUri, startUri);
-
-            await EnsureRingPlayerAsync();
-
-            _ringPlayer.Start();
+            await _librespot.LoadAndPlayAsync(
+                contextUri,
+                startUri,
+                isOffline ? null : orderedTrackUris);
         }
 
         private async Task<bool> EnsureLocalLibrespotConnectedAsync(
@@ -774,14 +962,31 @@ namespace LibreSpotUWP.Services
                 return false;
             }
 
+            var playbackAuthorization = await _playbackAuth.GetConnectionMaterialAsync().ConfigureAwait(false);
+            if (playbackAuthorization == null || playbackAuthorization.IsEmpty)
+            {
+                UpdateState(s =>
+                {
+                    s.StatusMessage = "Spotify playback authorization is required. Open Account settings to continue.";
+                });
+                return false;
+            }
+
             if ((forceFreshOnlineSession || _librespotTransportUnhealthy || requiresOnlineReconnect) && !isOffline)
             {
-                await _librespot.ReconnectWithAccessTokenAsync(accessToken).ConfigureAwait(false);
+                _ringPlayer?.BeginTransition(
+                    "reconnect",
+                    Current.Track?.Uri,
+                    Current.Track?.Uri,
+                    preserveCurrent: false,
+                    shouldPlay: Current.PlaybackState == LibrespotPlaybackState.Playing ||
+                        Current.PlaybackState == LibrespotPlaybackState.Loading);
+                await _librespot.ReconnectWithPlaybackAuthAsync(playbackAuthorization).ConfigureAwait(false);
                 _librespotTransportUnhealthy = false;
             }
             else
             {
-                await _librespot.ConnectWithAccessTokenAsync(accessToken).ConfigureAwait(false);
+                await _librespot.ConnectWithPlaybackAuthAsync(playbackAuthorization).ConfigureAwait(false);
             }
 
             if (!isOffline && !await WaitForLocalLibrespotSessionConnectedAsync(
@@ -887,6 +1092,73 @@ namespace LibreSpotUWP.Services
 
         public async Task PauseAsync()
         {
+            Volatile.Write(ref _playbackRequested, 0);
+            CancelProducerRecovery(resetAttemptBudget: true);
+            CancelPlaybackContinuationWatchdog();
+            await _playbackGate.WaitAsync();
+            try
+            {
+                await PauseCoreAsync();
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private void ScheduleApplicationQueueHydration(
+            long queueGeneration,
+            string contextUri,
+            string startUri,
+            int startIndex,
+            int initialTrackCount)
+        {
+            if (string.IsNullOrWhiteSpace(contextUri) || IsSpotifyTrackUri(contextUri))
+                return;
+
+            _ = HydrateApplicationQueueAsync(
+                queueGeneration,
+                contextUri,
+                startUri,
+                startIndex,
+                initialTrackCount);
+        }
+
+        private async Task HydrateApplicationQueueAsync(
+            long queueGeneration,
+            string contextUri,
+            string startUri,
+            int startIndex,
+            int initialTrackCount)
+        {
+            try
+            {
+                // Give the native load/context resolver priority over metadata work.
+                await Task.Delay(500, _lifetimeCancellation.Token).ConfigureAwait(false);
+                var resolvedQueueUris = await GetKnownTrackUrisForPlaybackContextAsync(contextUri).ConfigureAwait(false);
+                if (resolvedQueueUris == null || resolvedQueueUris.Count <= initialTrackCount)
+                    return;
+
+                if (_applicationQueue.TryHydrate(
+                    queueGeneration,
+                    resolvedQueueUris,
+                    startUri,
+                    startIndex))
+                {
+                    LogService.Info($"[MediaService.HydrateApplicationQueueAsync] Hydrated queue generation={queueGeneration}, context={contextUri}, tracks={resolvedQueueUris.Count}.");
+                }
+            }
+            catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaService.HydrateApplicationQueueAsync] Unable to hydrate {contextUri}: {ex.Message}");
+            }
+        }
+
+        private async Task PauseCoreAsync()
+        {
             CancelPlaybackContinuationWatchdog();
             ClearOnlineQueueRecoveryState(clearResumePoint: true);
             if (!IsSelectedSpotifyConnectDeviceLocal)
@@ -906,10 +1178,28 @@ namespace LibreSpotUWP.Services
                 return;
             }
 
+            // Keep draining PCM until the native player confirms Paused. Gating
+            // the ring first can fill the producer buffer and block the player
+            // thread before it gets a chance to process this command.
             await _librespot.PauseAsync();
         }
 
         public async Task ResumeAsync()
+        {
+            Volatile.Write(ref _playbackRequested, 1);
+            CancelProducerRecovery(resetAttemptBudget: true);
+            await _playbackGate.WaitAsync();
+            try
+            {
+                await ResumeCoreAsync();
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private async Task ResumeCoreAsync()
         {
             if (!IsSelectedSpotifyConnectDeviceLocal)
             {
@@ -924,8 +1214,10 @@ namespace LibreSpotUWP.Services
 
                     if (!string.IsNullOrWhiteSpace(Current.Track?.Uri))
                     {
-                        _pendingRestoreSeekMs = ClampPlaybackPosition(Current.PositionMs);
-                        await PlayAsync(
+                        SetPendingRestoreSeek(
+                            ClampPlaybackPosition(Current.PositionMs),
+                            Current.Track.Uri);
+                        await PlayCoreAsync(
                             string.IsNullOrWhiteSpace(Current.ContextUri) ? Current.Track.Uri : Current.ContextUri,
                             Current.Track.Uri).ConfigureAwait(false);
                     }
@@ -938,10 +1230,33 @@ namespace LibreSpotUWP.Services
                 return;
             }
 
-            if (_lastPlaybackSnapshot != null && _state.PlaybackState == LibrespotPlaybackState.Paused)
+            if (Current.PlaybackState == LibrespotPlaybackState.Playing ||
+                _librespot.PlaybackState == LibrespotPlaybackState.Playing)
             {
-                _pendingRestoreSeekMs = _lastPlaybackSnapshot.PositionMs;
-                await PlayAsync(
+                await EnsureRingPlayerAsync().ConfigureAwait(false);
+                var activeTrack = Current.Track ?? _librespot.CurrentTrack;
+                if (activeTrack?.AudioGeneration > 0 &&
+                    await _ringPlayer.RequestPlaybackAsync(
+                        activeTrack.PlayRequestId,
+                        activeTrack.AudioGeneration).ConfigureAwait(false))
+                {
+                    UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Playing);
+                    if (_mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Playing)
+                        _mediaPlayer.Play();
+                    _smtc.PlaybackStatus = MediaPlaybackStatus.Playing;
+                    return;
+                }
+            }
+
+            if (_restoredSnapshotPendingResume &&
+                _lastPlaybackSnapshot != null &&
+                _state.PlaybackState == LibrespotPlaybackState.Paused)
+            {
+                _restoredSnapshotPendingResume = false;
+                SetPendingRestoreSeek(
+                    _lastPlaybackSnapshot.PositionMs,
+                    _lastPlaybackSnapshot.TrackUri);
+                await PlayCoreAsync(
                     string.IsNullOrWhiteSpace(_lastPlaybackSnapshot.ContextUri) ? _lastPlaybackSnapshot.TrackUri : _lastPlaybackSnapshot.ContextUri,
                     _lastPlaybackSnapshot.TrackUri);
 
@@ -952,6 +1267,22 @@ namespace LibreSpotUWP.Services
         }
 
         public async Task StopAsync()
+        {
+            Volatile.Write(ref _playbackRequested, 0);
+            CancelProducerRecovery(resetAttemptBudget: true);
+            CancelPlaybackContinuationWatchdog();
+            await _playbackGate.WaitAsync();
+            try
+            {
+                await StopCoreAsync();
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private async Task StopCoreAsync()
         {
             CancelPlaybackContinuationWatchdog();
             ClearOnlineQueueRecoveryState(clearResumePoint: true);
@@ -972,28 +1303,130 @@ namespace LibreSpotUWP.Services
                 return;
             }
 
+            // Invalidate an in-flight load/seek immediately. Waiting for the
+            // native Stopped event would leave delayed PCM able to satisfy the
+            // pending pre-roll after the user has cancelled playback.
+            _ringPlayer?.Stop();
+            _mediaPlayer?.Pause();
             await _librespot.StopAsync();
+        }
+
+        public Task PrepareForSuspendingAsync()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return Task.CompletedTask;
+
+            var playbackState = Current.PlaybackState;
+            var shouldKeepRunning = BackgroundPlaybackPolicy.ShouldKeepRunning(
+                IsSelectedSpotifyConnectDeviceLocal,
+                Volatile.Read(ref _playbackRequested) != 0,
+                playbackState == LibrespotPlaybackState.Playing ||
+                    playbackState == LibrespotPlaybackState.Loading);
+            if (shouldKeepRunning)
+            {
+                // MediaPlayer owns the app's UWP background-media sponsorship;
+                // the selected AudioGraph/native renderer carries the audible
+                // PCM. Pausing either one here turns the phone's Home button into
+                // a transport command and prevents queue work from continuing.
+                Interlocked.Exchange(ref _suspended, 0);
+                Interlocked.Exchange(ref _producerRecoveryBlocked, 0);
+                if (_mediaPlayer != null &&
+                    _mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Playing)
+                {
+                    _mediaPlayer.Play();
+                }
+
+                PersistPlaybackSnapshot(forceWrite: true);
+                LogService.Info($"[MediaService.PrepareForSuspendingAsync] Preserving active local background playback. graphId={_ringPlayer?.GraphInstanceId ?? 0}, sessionGeneration={_librespot.SessionGeneration}, state={playbackState}.");
+                return Task.CompletedTask;
+            }
+
+            if (Interlocked.Exchange(ref _suspended, 1) != 0)
+                return Task.CompletedTask;
+
+            CancelProducerRecovery(resetAttemptBudget: false);
+            CancelPlaybackContinuationWatchdog();
+            PersistPlaybackSnapshot(forceWrite: true);
+            LogService.Info($"[MediaService.PrepareForSuspendingAsync] Suspending inactive or remote media coordination. graphId={_ringPlayer?.GraphInstanceId ?? 0}, sessionGeneration={_librespot.SessionGeneration}, state={playbackState}.");
+            return Task.CompletedTask;
+        }
+
+        public Task ResumeAfterSuspendingAsync()
+        {
+            if (Volatile.Read(ref _disposed) != 0 || Interlocked.Exchange(ref _suspended, 0) == 0)
+                return Task.CompletedTask;
+
+            Interlocked.Exchange(ref _producerRecoveryBlocked, 0);
+            LogService.Info($"[MediaService.ResumeAfterSuspendingAsync] Inactive media coordination resumed. graphId={_ringPlayer?.GraphInstanceId ?? 0}, sessionGeneration={_librespot.SessionGeneration}.");
+            return Task.CompletedTask;
         }
 
         private void VolumeDebounceTimer_Tick(object sender, object e)
         {
-            if (!_volumeDirty)
+            if (Volatile.Read(ref _volumeDirty) == 0)
                 return;
 
-            _volumeDirty = false;
-            _ = SetVolumeAsync(_pendingVolume);
+            _ = ApplyPendingVolumeAsync();
         }
 
         public void SetVolumeDebounced(double percent)
         {
-            ushort raw = (ushort)(percent * 65535 / 100);
-            _pendingVolume = raw;
-            _volumeDirty = true;
+            var boundedPercent = Math.Max(0, Math.Min(100, percent));
+            var raw = (ushort)Math.Round(boundedPercent * 65535 / 100);
+            Volatile.Write(ref _pendingVolume, raw);
+            Interlocked.Increment(ref _volumeVersion);
+            Interlocked.Exchange(ref _volumeDirty, 1);
 
-            var settings = Windows.Storage.ApplicationData.Current.LocalSettings;
-            settings.Values[VolumeKey] = raw;
+            // Preserve the locally-rendered slider value in future state
+            // snapshots without broadcasting a full UI update for every pixel.
+            // The debounced apply publishes one authoritative update.
+            UpdateStateWithoutNotification(s => s.Volume = raw);
+        }
 
-            UpdateState(s => s.Volume = raw);
+        private async Task ApplyPendingVolumeAsync()
+        {
+            if (Interlocked.CompareExchange(ref _volumeUpdateRunning, 1, 0) != 0)
+                return;
+
+            try
+            {
+                while (Volatile.Read(ref _volumeDirty) != 0)
+                {
+                    Interlocked.Exchange(ref _volumeDirty, 0);
+                    var version = Volatile.Read(ref _volumeVersion);
+                    var volume = (ushort)Volatile.Read(ref _pendingVolume);
+
+                    try
+                    {
+                        await SetVolumeAsync(volume).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogService.Warn($"[MediaService.ApplyPendingVolumeAsync] Unable to apply volume {volume}: {ex.Message}");
+                        if (version == Volatile.Read(ref _volumeVersion))
+                            Volatile.Write(ref _volumeAppliedVersion, version);
+                        continue;
+                    }
+
+                    // A newer slider position arrived while the request was in
+                    // flight. Let the loop apply that value and skip stale
+                    // persistence/UI work for this one.
+                    if (version != Volatile.Read(ref _volumeVersion))
+                        continue;
+
+                    Volatile.Write(ref _volumeAppliedVersion, version);
+                    var settings = Windows.Storage.ApplicationData.Current.LocalSettings;
+                    settings.Values[VolumeKey] = volume;
+                    UpdateState(s => s.Volume = volume);
+                    PersistPlaybackSnapshot();
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _volumeUpdateRunning, 0);
+                if (Volatile.Read(ref _volumeDirty) != 0)
+                    _ = ApplyPendingVolumeAsync();
+            }
         }
 
         public async Task SetShuffleAsync(bool enabled)
@@ -1013,6 +1446,8 @@ namespace LibreSpotUWP.Services
                 }
 
                 UpdateState(s => s.Shuffle = enabled);
+                _applicationQueue.UpdateShuffle(enabled);
+                SyncSmtcShuffle(enabled);
                 await RefreshSpotifyConnectPlaybackAsync(force: true).ConfigureAwait(false);
                 return;
             }
@@ -1020,6 +1455,8 @@ namespace LibreSpotUWP.Services
             await _librespot.SetShuffleAsync(enabled);
 
             UpdateState(s => s.Shuffle = enabled);
+            _applicationQueue.UpdateShuffle(enabled);
+            SyncSmtcShuffle(enabled);
         }
 
         public async Task SetRepeatAsync(int mode)
@@ -1039,6 +1476,8 @@ namespace LibreSpotUWP.Services
                 }
 
                 UpdateState(s => s.RepeatMode = mode);
+                _applicationQueue.UpdateRepeatMode(mode);
+                SyncSmtcRepeat((uint)mode);
                 await RefreshSpotifyConnectPlaybackAsync(force: true).ConfigureAwait(false);
                 return;
             }
@@ -1046,6 +1485,8 @@ namespace LibreSpotUWP.Services
             await _librespot.SetRepeatAsync((uint)mode);
 
             UpdateState(s => s.RepeatMode = mode);
+            _applicationQueue.UpdateRepeatMode(mode);
+            SyncSmtcRepeat((uint)mode);
         }
 
         public async Task SetCurrentTrackPersistedAsync(bool persisted)
@@ -1110,6 +1551,7 @@ namespace LibreSpotUWP.Services
         public Task SetAudioEffectsPresetAsync(string preset)
         {
             UserSettings.AudioEffectsPreset = string.IsNullOrWhiteSpace(preset) ? "None" : preset;
+            NativeWindowsAudioPlayer.ApplyEffects();
             _ringPlayer?.SetAudioEffectsPreset(UserSettings.AudioEffectsPreset);
             return Task.CompletedTask;
         }
@@ -1165,26 +1607,136 @@ namespace LibreSpotUWP.Services
         public async Task SetAudioOutputDeviceAsync(string deviceId)
         {
             deviceId = deviceId ?? string.Empty;
-            if (string.Equals(UserSettings.AudioOutputDeviceId, deviceId, StringComparison.Ordinal))
-                return;
-
-            UserSettings.AudioOutputDeviceId = deviceId;
-            var wasPlaying = Current.PlaybackState == LibrespotPlaybackState.Playing;
-
-            _ringPlayer?.Stop();
-            _ringPlayer?.Dispose();
-            _ringPlayer = null;
-
-            if ((_librespot as LibrespotService)?.HasInstance != true)
-                return;
-
-            await EnsureRingPlayerAsync();
-            if (wasPlaying)
+            await _audioConfigurationGate.WaitAsync().ConfigureAwait(false);
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
+            try
             {
-                if (_mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Playing)
-                    _mediaPlayer.Play();
+                if (string.Equals(UserSettings.AudioOutputDeviceId, deviceId, StringComparison.Ordinal))
+                    return;
 
-                _ringPlayer.Start();
+                var previousDeviceId = UserSettings.AudioOutputDeviceId;
+                var backend = UserSettings.AudioBackend;
+                try
+                {
+                    if (backend == AudioBackendKind.RingBuffer)
+                    {
+                        // AudioGraph binds its render device during creation, so
+                        // changing a Ring Buffer output requires a replacement graph.
+                        await RecreateAudioPlayerAsync(
+                            "output-device-change",
+                            backend,
+                            deviceId).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // The Rust renderers monitor the native backend selection
+                        // generation and can switch endpoints without replacing the
+                        // managed player or seeking the active track.
+                        await _ringPlayerGate.WaitAsync().ConfigureAwait(false);
+                        try
+                        {
+                            await NativeWindowsAudioPlayer.SelectBackendAsync(backend, deviceId).ConfigureAwait(false);
+                            NativeWindowsAudioPlayer.ApplyEffects();
+                            (_ringPlayer as NativeWindowsAudioPlayer)?.CommitOutputDevice(deviceId);
+                        }
+                        finally
+                        {
+                            _ringPlayerGate.Release();
+                        }
+                    }
+
+                    // Commit only after the selected endpoint has initialized.
+                    UserSettings.AudioOutputDeviceId = deviceId;
+                    LogService.Info(
+                        $"[MediaService.SetAudioOutputDeviceAsync] backend={backend}, " +
+                        $"outputDevice={(deviceId.Length == 0 ? "default" : deviceId)}, " +
+                        $"liveNativeSwitch={backend != AudioBackendKind.RingBuffer}.");
+                }
+                catch (Exception changeError)
+                {
+                    try
+                    {
+                        if (backend == AudioBackendKind.RingBuffer)
+                        {
+                            await RecreateAudioPlayerAsync(
+                                "output-device-rollback",
+                                backend,
+                                previousDeviceId).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await _ringPlayerGate.WaitAsync().ConfigureAwait(false);
+                            try
+                            {
+                                await NativeWindowsAudioPlayer.SelectBackendAsync(backend, previousDeviceId).ConfigureAwait(false);
+                                NativeWindowsAudioPlayer.ApplyEffects();
+                            }
+                            finally
+                            {
+                                _ringPlayerGate.Release();
+                            }
+                        }
+                    }
+                    catch (Exception rollbackError)
+                    {
+                        LogService.Error(rollbackError, "[MediaService.SetAudioOutputDeviceAsync] Audio output rollback failed");
+                    }
+
+                    UpdateState(state => state.StatusMessage = "Unable to change audio output. The previous output was restored.");
+                    throw new InvalidOperationException("Unable to change the audio output device.", changeError);
+                }
+            }
+            finally
+            {
+                _playbackGate.Release();
+                _audioConfigurationGate.Release();
+            }
+        }
+
+        public async Task SetAudioBackendAsync(AudioBackendKind backend)
+        {
+            if (!Enum.IsDefined(typeof(AudioBackendKind), backend))
+                throw new ArgumentOutOfRangeException(nameof(backend));
+
+            await _audioConfigurationGate.WaitAsync().ConfigureAwait(false);
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (UserSettings.AudioBackend == backend)
+                    return;
+
+                var previousBackend = UserSettings.AudioBackend;
+                var outputDeviceId = UserSettings.AudioOutputDeviceId;
+                try
+                {
+                    await RecreateAudioPlayerAsync(
+                        "audio-backend-change",
+                        backend,
+                        outputDeviceId).ConfigureAwait(false);
+                    UserSettings.AudioBackend = backend;
+                }
+                catch (Exception changeError)
+                {
+                    try
+                    {
+                        await RecreateAudioPlayerAsync(
+                            "audio-backend-rollback",
+                            previousBackend,
+                            outputDeviceId).ConfigureAwait(false);
+                    }
+                    catch (Exception rollbackError)
+                    {
+                        LogService.Error(rollbackError, "[MediaService.SetAudioBackendAsync] Audio backend rollback failed");
+                    }
+
+                    UpdateState(state => state.StatusMessage = "Unable to change the audio backend. The previous backend was restored.");
+                    throw new InvalidOperationException("Unable to change the audio backend.", changeError);
+                }
+            }
+            finally
+            {
+                _playbackGate.Release();
+                _audioConfigurationGate.Release();
             }
         }
 
@@ -1194,9 +1746,21 @@ namespace LibreSpotUWP.Services
             if (string.IsNullOrWhiteSpace(trackUri) || !trackUri.StartsWith("spotify:track:", StringComparison.OrdinalIgnoreCase))
                 return;
 
+            var version = Interlocked.Increment(ref _metadataRefreshVersion);
             var id = trackUri.Replace("spotify:track:", "");
-            var offlineTrack = await App.OfflineCatalog.GetDownloadedTrackAsync(trackUri);
-            var metadata = await _web.GetTrackAsync(id, true);
+            OfflineTrackEntry offlineTrack;
+            CacheResponse<FullTrack> metadata;
+            using (UiResponsivenessTelemetry.BeginOperation("Metadata.Refresh", version))
+            {
+                offlineTrack = await App.OfflineCatalog.GetDownloadedTrackAsync(trackUri);
+                metadata = await _web.GetTrackAsync(id, true);
+            }
+
+            if (version != _metadataRefreshVersion ||
+                !string.Equals(Current?.Track?.Uri, trackUri, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
 
             UpdateState(state =>
             {
@@ -1212,6 +1776,13 @@ namespace LibreSpotUWP.Services
         }
         public void Next()
         {
+            CancelProducerRecovery(resetAttemptBudget: true);
+            CancelPlaybackContinuationWatchdog();
+            _ = RunSerializedPlaybackCommandAsync(NextCoreAsync);
+        }
+
+        private async Task NextCoreAsync()
+        {
             if (!IsSelectedSpotifyConnectDeviceLocal)
             {
                 _ = SkipRemoteAsync(1);
@@ -1224,11 +1795,37 @@ namespace LibreSpotUWP.Services
             if (TryHandleLocalOfflineSkip(1, shouldContinuePlaying, "next"))
                 return;
 
+            var transition = _applicationQueue.BeginManualMove(
+                1,
+                Current.Track?.PlayRequestId ?? 0,
+                _librespot.SessionGeneration,
+                IsApplicationQueueTrackPlayable);
+            if (await TryLoadManualApplicationQueueTargetAsync(
+                transition,
+                shouldContinuePlaying,
+                "next").ConfigureAwait(false))
+            {
+                return;
+            }
+
+            _ringPlayer?.BeginTransition(
+                "next",
+                Current.Track?.Uri,
+                null,
+                preserveCurrent: false,
+                shouldPlay: shouldContinuePlaying);
+            UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Loading);
             _librespot.Next();
-            SchedulePlaybackContinuationWatchdog(shouldContinuePlaying, "next", allowStopped: false);
         }
 
         public void Previous()
+        {
+            CancelProducerRecovery(resetAttemptBudget: true);
+            CancelPlaybackContinuationWatchdog();
+            _ = RunSerializedPlaybackCommandAsync(PreviousCoreAsync);
+        }
+
+        private async Task PreviousCoreAsync()
         {
             if (!IsSelectedSpotifyConnectDeviceLocal)
             {
@@ -1242,8 +1839,81 @@ namespace LibreSpotUWP.Services
             if (TryHandleLocalOfflineSkip(-1, shouldContinuePlaying, "previous"))
                 return;
 
+            var transition = _applicationQueue.BeginManualMove(
+                -1,
+                Current.Track?.PlayRequestId ?? 0,
+                _librespot.SessionGeneration,
+                IsApplicationQueueTrackPlayable);
+            if (await TryLoadManualApplicationQueueTargetAsync(
+                transition,
+                shouldContinuePlaying,
+                "previous").ConfigureAwait(false))
+            {
+                return;
+            }
+
+            _ringPlayer?.BeginTransition(
+                "previous",
+                Current.Track?.Uri,
+                null,
+                preserveCurrent: false,
+                shouldPlay: shouldContinuePlaying);
+            UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Loading);
             _librespot.Previous();
-            SchedulePlaybackContinuationWatchdog(shouldContinuePlaying, "previous", allowStopped: false);
+        }
+
+        private async Task<bool> TryLoadManualApplicationQueueTargetAsync(
+            ApplicationQueueTransition transition,
+            bool shouldContinuePlaying,
+            string reason)
+        {
+            if (transition == null || !transition.IsValid || string.IsNullOrWhiteSpace(transition.ExpectedUri))
+                return false;
+
+            var snapshot = _applicationQueue.Snapshot;
+            if (snapshot.TrackUris == null || snapshot.TrackUris.Count == 0)
+                return false;
+
+            LogService.Info($"[MediaService.TryLoadManualApplicationQueueTargetAsync] {reason} expected={transition.ExpectedUri}, queueGeneration={transition.QueueGenerationId}, transition={transition.TransitionId}.");
+            await EnsureRingPlayerAsync().ConfigureAwait(false);
+            _ringPlayer.BeginTransition(
+                reason,
+                Current.Track?.Uri,
+                transition.ExpectedUri,
+                preserveCurrent: false,
+                shouldPlay: shouldContinuePlaying);
+            UpdateState(state => state.PlaybackState = LibrespotPlaybackState.Loading);
+            if (_mediaPlayer.PlaybackSession.PlaybackState == MediaPlaybackState.Playing)
+                _mediaPlayer.Pause();
+            ApplyPlaybackPosition(0, persistSnapshot: false);
+
+            var contextUri = string.IsNullOrWhiteSpace(snapshot.ContextUri)
+                ? transition.ExpectedUri
+                : snapshot.ContextUri;
+            await _librespot.LoadAndPlayAsync(
+                contextUri,
+                transition.ExpectedUri,
+                snapshot.TrackUris,
+                shouldContinuePlaying).ConfigureAwait(false);
+            return true;
+        }
+
+        private async Task RunSerializedPlaybackCommandAsync(Func<Task> command)
+        {
+            await _playbackGate.WaitAsync();
+            try
+            {
+                if (Volatile.Read(ref _disposed) == 0 && Volatile.Read(ref _suspended) == 0)
+                    await command().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogService.Error(ex, "[MediaService.RunSerializedPlaybackCommandAsync] Playback command failed");
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
         }
 
         private bool TryHandleLocalOfflineSkip(int delta, bool shouldContinuePlaying, string reason)
@@ -1261,7 +1931,6 @@ namespace LibreSpotUWP.Services
 
             if (TryPlayOfflineRelativeTrack(delta))
             {
-                SchedulePlaybackContinuationWatchdog(shouldContinuePlaying, reason, allowStopped: false);
                 return true;
             }
 
@@ -1280,75 +1949,80 @@ namespace LibreSpotUWP.Services
             return true;
         }
 
-        private void SchedulePlaybackContinuationWatchdog(bool shouldContinuePlaying, string reason, bool allowStopped)
-        {
-            var version = Interlocked.Increment(ref _playbackContinuationVersion);
-            if (shouldContinuePlaying)
-                _ = EnsurePlaybackContinuesAfterTransitionAsync(version, reason, allowStopped);
-        }
-
         private void CancelPlaybackContinuationWatchdog()
         {
-            Interlocked.Increment(ref _playbackContinuationVersion);
-            Interlocked.Exchange(ref _pendingEndOfTrackContinuationVersion, 0);
-        }
-
-        private async Task EnsurePlaybackContinuesAfterTransitionAsync(int version, string reason, bool allowStopped)
-        {
-            await Task.Delay(1500);
-            if (version != _playbackContinuationVersion)
-                return;
-
-            var state = Current.PlaybackState;
-            if (state != LibrespotPlaybackState.Paused &&
-                state != LibrespotPlaybackState.Loading &&
-                (!allowStopped || state != LibrespotPlaybackState.Stopped))
-                return;
-
-            try
-            {
-                LogService.Warn($"[MediaService.EnsurePlaybackContinuesAfterTransitionAsync] Playback was {state} after {reason}; requesting resume.");
-                await _librespot.ResumeAsync();
-                await EnsureRingPlayerAsync();
-
-                if (_mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Playing)
-                    _mediaPlayer.Play();
-
-                _ringPlayer?.Start();
-                _smtc.PlaybackStatus = MediaPlaybackStatus.Playing;
-            }
-            catch (Exception ex)
-            {
-                LogService.Warn($"[MediaService.EnsurePlaybackContinuesAfterTransitionAsync] Unable to resume after {reason}: {ex.Message}");
-            }
-        }
-
-        private void ArmEndOfTrackContinuation()
-        {
-            var version = Interlocked.Increment(ref _pendingEndOfTrackContinuationVersion);
-            _ = ClearEndOfTrackContinuationIfUnusedAsync(version);
-        }
-
-        private bool TryConsumeEndOfTrackContinuation()
-        {
-            return Interlocked.Exchange(ref _pendingEndOfTrackContinuationVersion, 0) != 0;
-        }
-
-        private async Task ClearEndOfTrackContinuationIfUnusedAsync(int version)
-        {
-            await Task.Delay(10000);
-            Interlocked.CompareExchange(ref _pendingEndOfTrackContinuationVersion, 0, version);
+            LogApplicationQueueTransitionResult(_applicationQueue.CancelPendingTransition(
+                "superseded-by-serialized-command",
+                DateTimeOffset.UtcNow));
         }
 
         public void Seek(uint posMs)
         {
-            if (!IsSelectedSpotifyConnectDeviceLocal)
-            {
-                _ = SeekRemoteAsync(posMs);
-                return;
-            }
+            CancelProducerRecovery(resetAttemptBudget: true);
+            CancelPlaybackContinuationWatchdog();
+            _ = SeekSerializedAsync(posMs);
+        }
 
-            _librespot.Seek(posMs);
+        private async Task SeekSerializedAsync(uint posMs)
+        {
+            await _playbackGate.WaitAsync();
+            try
+            {
+                if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _suspended) != 0)
+                    return;
+
+                posMs = ClampPlaybackPosition(posMs);
+                var request = _positionSynchronizer.BeginUserSeek(posMs);
+                ApplyPlaybackPosition(posMs, persistSnapshot: false);
+
+                if (!IsSelectedSpotifyConnectDeviceLocal)
+                {
+                    await SeekRemoteAsync(request).ConfigureAwait(false);
+                    return;
+                }
+
+                var shouldContinuePlaying = Current.PlaybackState == LibrespotPlaybackState.Playing
+                    || Current.PlaybackState == LibrespotPlaybackState.Loading;
+                await SeekLocalAsync(request, shouldContinuePlaying).ConfigureAwait(false);
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private async Task SeekLocalAsync(PositionSeekRequest request, bool shouldContinuePlaying)
+        {
+            try
+            {
+                await Task.Run(() =>
+                {
+                    // Decoder seek and transition work never runs synchronously in
+                    // the slider/UI event. A superseded origin token is discarded.
+                    if (!_positionSynchronizer.TryRecordSeekIssued(request))
+                        return;
+
+                    _ringPlayer?.BeginTransition(
+                        "seek",
+                        Current.Track?.Uri,
+                        Current.Track?.Uri,
+                        preserveCurrent: false,
+                        shouldPlay: shouldContinuePlaying);
+                    UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Loading);
+                    _librespot.Seek(request.PositionMs);
+                }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogService.Error(ex, $"[MediaService.SeekLocalAsync] Unable to seek to {request?.PositionMs}ms");
+            }
+        }
+
+        private async Task IssueSystemLibrespotSeekAsync(uint positionMs)
+        {
+            _positionSynchronizer.Reset(positionMs);
+            _positionSynchronizer.RecordSystemSeekIssued();
+            await Task.Run(() => _librespot.Seek(positionMs)).ConfigureAwait(false);
         }
 
         private async Task SkipRemoteAsync(int delta)
@@ -1372,12 +2046,15 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        private async Task SeekRemoteAsync(uint posMs)
+        private async Task SeekRemoteAsync(PositionSeekRequest request)
         {
             try
             {
-                await _web.SeekToAsync(GetSelectedSpotifyConnectDeviceId(), posMs).ConfigureAwait(false);
-                ApplyPlaybackPosition(posMs, persistSnapshot: false);
+                if (!_positionSynchronizer.TryRecordSeekIssued(request))
+                    return;
+
+                await _web.SeekToAsync(GetSelectedSpotifyConnectDeviceId(), request.PositionMs).ConfigureAwait(false);
+                ApplyPlaybackPosition(request.PositionMs, persistSnapshot: false);
                 await RefreshSpotifyConnectPlaybackAsync(force: true).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -1391,15 +2068,55 @@ namespace LibreSpotUWP.Services
 
         private async Task EnsureRingPlayerAsync()
         {
-            if (_ringPlayer != null)
-                return;
+            await _ringPlayerGate.WaitAsync();
+            try
+            {
+                if (_ringPlayer != null)
+                {
+                    await _ringPlayer.InitializeAsync();
+                    _ringPlayer.SetSessionState(_librespot.Session.IsConnected, _librespot.SessionGeneration);
+                    return;
+                }
 
-            var props = (_librespot as LibrespotService)?.EncodingProperties
-                        ?? AudioEncodingProperties.CreatePcm(44100, 2, 16);
+                _ringPlayer = await CreateAudioPlayerAsync(
+                    UserSettings.AudioBackend,
+                    UserSettings.AudioOutputDeviceId).ConfigureAwait(false);
+            }
+            finally
+            {
+                _ringPlayerGate.Release();
+            }
+        }
 
-            _ringPlayer = new LibrespotRingBufferPlayer(props, UserSettings.AudioOutputDeviceId);
-            await _ringPlayer.InitializeAsync();
-            _ringPlayer.SetAudioEffectsPreset(UserSettings.AudioEffectsPreset);
+        private async Task<ILibrespotAudioPlayer> CreateAudioPlayerAsync(
+            AudioBackendKind backend,
+            string outputDeviceId)
+        {
+            ILibrespotAudioPlayer player;
+            if (backend == AudioBackendKind.RingBuffer)
+            {
+                var props = (_librespot as LibrespotService)?.EncodingProperties
+                            ?? AudioEncodingProperties.CreatePcm(44100, 2, 16);
+                player = new LibrespotRingBufferPlayer(props, outputDeviceId);
+            }
+            else
+            {
+                player = new NativeWindowsAudioPlayer(backend, outputDeviceId);
+            }
+
+            try
+            {
+                await player.InitializeAsync().ConfigureAwait(false);
+                player.SetAudioEffectsPreset(UserSettings.AudioEffectsPreset);
+                player.SetSessionState(_librespot.Session.IsConnected, _librespot.SessionGeneration);
+                player.ProducerStalled += OnProducerStalled;
+                return player;
+            }
+            catch
+            {
+                await player.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
         }
 
         private async Task PrewarmRingPlayerAsync()
@@ -1407,16 +2124,107 @@ namespace LibreSpotUWP.Services
             if ((_librespot as LibrespotService)?.HasInstance != true)
                 return;
 
+            var requestedBackend = UserSettings.AudioBackend;
             try
             {
                 await EnsureRingPlayerAsync();
                 _ringPlayer?.Stop();
-                LogService.Info("[MediaService.PrewarmRingPlayerAsync] Ring buffer player initialized during startup.");
+                LogService.Info($"[MediaService.PrewarmRingPlayerAsync] Audio backend initialized during startup: {requestedBackend}.");
             }
             catch (Exception ex)
             {
-                LogService.Warn($"[MediaService.PrewarmRingPlayerAsync] Unable to prewarm ring buffer player: {ex.Message}");
+                LogService.Warn($"[MediaService.PrewarmRingPlayerAsync] Unable to prewarm audio backend {requestedBackend}: {ex.Message}");
+                if (requestedBackend == AudioBackendKind.RustWasapi)
+                    return;
+
+                await _audioConfigurationGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (UserSettings.AudioBackend != requestedBackend)
+                        return;
+
+                    UserSettings.AudioBackend = AudioBackendKind.RustWasapi;
+                    try
+                    {
+                        await EnsureRingPlayerAsync().ConfigureAwait(false);
+                        _ringPlayer?.Stop();
+                        LogService.Warn($"[MediaService.PrewarmRingPlayerAsync] Falling back from {requestedBackend} to RustWasapi.");
+                    }
+                    catch (Exception fallbackError)
+                    {
+                        LogService.Warn($"[MediaService.PrewarmRingPlayerAsync] WASAPI fallback failed: {fallbackError.Message}");
+                    }
+                }
+                finally
+                {
+                    _audioConfigurationGate.Release();
+                }
             }
+        }
+
+        private async Task RecreateAudioPlayerAsync(
+            string reason,
+            AudioBackendKind backend,
+            string outputDeviceId)
+        {
+            var wasPlaying =
+                Volatile.Read(ref _playbackRequested) != 0 ||
+                Current.PlaybackState == LibrespotPlaybackState.Playing ||
+                _librespot.PlaybackState == LibrespotPlaybackState.Playing;
+            var position = Current.PositionMs;
+
+            // The Rust call probes the complete replacement graph before it
+            // publishes the selection. A rejected backend therefore leaves
+            // the current renderer and managed controller untouched.
+            await NativeWindowsAudioPlayer.SelectBackendAsync(
+                backend,
+                outputDeviceId).ConfigureAwait(false);
+            NativeWindowsAudioPlayer.ApplyEffects();
+
+            if ((_librespot as LibrespotService)?.HasInstance != true)
+                return;
+
+            ILibrespotAudioPlayer previousPlayer = null;
+            ILibrespotAudioPlayer replacementPlayer;
+            await _ringPlayerGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                replacementPlayer = await CreateAudioPlayerAsync(backend, outputDeviceId).ConfigureAwait(false);
+                previousPlayer = _ringPlayer;
+                _ringPlayer = replacementPlayer;
+                if (previousPlayer != null)
+                    previousPlayer.ProducerStalled -= OnProducerStalled;
+            }
+            finally
+            {
+                _ringPlayerGate.Release();
+            }
+
+            if (previousPlayer != null)
+            {
+                try
+                {
+                    previousPlayer.Stop();
+                    await previousPlayer.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    LogService.Warn($"[MediaService.RecreateAudioPlayerAsync] Previous audio player cleanup failed after replacement: {ex.Message}");
+                }
+            }
+
+            if (wasPlaying)
+            {
+                replacementPlayer.BeginTransition(
+                    reason,
+                    Current.Track?.Uri,
+                    Current.Track?.Uri,
+                    preserveCurrent: false,
+                    shouldPlay: true);
+                await IssueSystemLibrespotSeekAsync(position).ConfigureAwait(false);
+            }
+
+            LogService.Info($"[MediaService.RecreateAudioPlayerAsync] backend={backend}, reason={reason}, resumed={wasPlaying}.");
         }
 
         private async Task RefreshSpotifyConnectPlaybackAsync(bool force = false)
@@ -1490,6 +2298,20 @@ namespace LibreSpotUWP.Services
 
         private void ApplyRemotePlayback(CurrentlyPlayingContext playback)
         {
+            var transferObservation = _spotifyConnectTransfer.Observe(
+                playback?.Device?.Id,
+                DateTimeOffset.UtcNow);
+            if (transferObservation == SpotifyConnectTransferObservation.IgnoreStaleSnapshot)
+            {
+                LogService.Info("[MediaService.ApplyRemotePlayback] Ignoring stale playback snapshot while a Connect transfer is pending.");
+                return;
+            }
+
+            if (transferObservation == SpotifyConnectTransferObservation.Confirmed)
+                LogService.Info("[MediaService.ApplyRemotePlayback] Connect transfer confirmed by the active device snapshot.");
+            else if (transferObservation == SpotifyConnectTransferObservation.Expired)
+                LogService.Warn("[MediaService.ApplyRemotePlayback] Connect transfer confirmation timed out; accepting the current active device snapshot.");
+
             var selectedId = GetSelectedSpotifyConnectDeviceId();
             var wasSelectedLocal = IsLocalSpotifyConnectDeviceId(selectedId);
             if (playback == null)
@@ -1539,10 +2361,26 @@ namespace LibreSpotUWP.Services
             var trackInfo = CreateTrackInfo(playback.Item);
             var fullTrack = playback.Item as FullTrack;
             var progress = playback.ProgressMs < 0 ? 0 : (uint)playback.ProgressMs;
+            var remoteTrackChanged = !string.Equals(
+                Current.Track?.Uri,
+                trackInfo?.Uri,
+                StringComparison.OrdinalIgnoreCase);
 
-            _remotePositionBaseMs = progress;
-            _remotePositionUpdatedAt = DateTimeOffset.UtcNow;
+            _hasRemotePositionAnchor = true;
 
+            if (remoteTrackChanged)
+                _positionSynchronizer.Reset(progress);
+            else
+                _positionSynchronizer.ObserveAuthoritative(
+                    progress,
+                    PlaybackPositionOrigin.RemoteConnect,
+                    playback.IsPlaying);
+
+            var synchronizedProgress = _positionSynchronizer.GetEstimatedPosition(
+                trackInfo != null ? (uint)trackInfo.Duration.TotalMilliseconds : Current.DurationMs,
+                playback.IsPlaying);
+
+            var repeatMode = MapRepeatMode(playback.RepeatState);
             UpdateState(s =>
             {
                 s.SpotifyConnectDeviceId = selectedId;
@@ -1551,7 +2389,7 @@ namespace LibreSpotUWP.Services
                 s.Track = trackInfo;
                 s.Metadata = fullTrack;
                 s.PlaybackState = playback.IsPlaying ? LibrespotPlaybackState.Playing : LibrespotPlaybackState.Paused;
-                s.PositionMs = progress;
+                s.PositionMs = synchronizedProgress;
                 s.DurationMs = trackInfo != null ? (uint)trackInfo.Duration.TotalMilliseconds : s.DurationMs;
                 s.ContextUri = playback.Context?.Uri ?? s.ContextUri;
                 s.ContextName = ResolveImmediateContextName(s.ContextUri, fullTrack);
@@ -1561,25 +2399,27 @@ namespace LibreSpotUWP.Services
                 s.IsCurrentTrackPersisted = trackInfo != null && App.OfflineCatalog.IsTrackPersisted(trackInfo.Uri);
                 s.StatusMessage = null;
                 s.Shuffle = playback.ShuffleState;
-                s.RepeatMode = MapRepeatMode(playback.RepeatState);
+                s.RepeatMode = repeatMode;
                 if (device?.VolumePercent.HasValue == true)
                     s.Volume = (ushort)Math.Max(0, Math.Min(65535, device.VolumePercent.Value * 65535 / 100));
             });
 
             UpdateSmtcDisplay();
-            UpdateSmtcTimeline(progress);
+            UpdateSmtcTimeline(synchronizedProgress);
             if (_smtc != null)
                 _smtc.PlaybackStatus = playback.IsPlaying ? MediaPlaybackStatus.Playing : MediaPlaybackStatus.Paused;
+            SyncSmtcShuffle(playback.ShuffleState);
+            SyncSmtcRepeat((uint)repeatMode);
         }
 
         private void UpdateEstimatedRemotePosition()
         {
-            if (_state.PlaybackState != LibrespotPlaybackState.Playing || _remotePositionUpdatedAt == DateTimeOffset.MinValue)
+            if (_state.PlaybackState != LibrespotPlaybackState.Playing || !_hasRemotePositionAnchor)
                 return;
 
-            var elapsed = DateTimeOffset.UtcNow - _remotePositionUpdatedAt;
-            var estimated = _remotePositionBaseMs + (uint)Math.Max(0, elapsed.TotalMilliseconds);
-            ApplyPlaybackPosition(estimated, persistSnapshot: false);
+            // Local progression comes from Stopwatch through the synchronizer;
+            // wall-clock changes must not move a remote Connect position.
+            PublishSynchronizedPosition(persistSnapshot: false);
         }
 
         private static LibrespotTrackInfo CreateTrackInfo(IPlayableItem item)
@@ -1643,14 +2483,20 @@ namespace LibreSpotUWP.Services
                 if (!IsSelectedSpotifyConnectDeviceLocal)
                     return;
 
+                if (track != null && track.SessionGeneration != _librespot.SessionGeneration)
+                {
+                    LogService.Info($"[MediaService.OnTrackChanged] Ignoring stale session event. eventSessionGeneration={track.SessionGeneration}, activeSessionGeneration={_librespot.SessionGeneration}.");
+                    return;
+                }
+
                 var changeVersion = Interlocked.Increment(ref _trackChangeVersion);
                 if (track == null)
                 {
+                    _positionSynchronizer.Reset(0);
                     UpdateState(state =>
                     {
                         state.Track = null;
                         state.Metadata = null;
-                        state.IsNarrationActive = false;
                         state.PositionMs = 0;
                         state.DurationMs = 0;
                         state.IsCurrentTrackPersisted = false;
@@ -1663,11 +2509,62 @@ namespace LibreSpotUWP.Services
                     return;
                 }
 
+                await EnsureRingPlayerAsync();
+                if (!_ringPlayer.ObserveTrackChanged(
+                    track.Uri,
+                    track.PlayRequestId,
+                    track.AudioGeneration,
+                    track.WasPreloaded))
+                {
+                    LogService.Info($"[MediaService.OnTrackChanged] Ignoring stale track event uri={track.Uri}, generation={track.AudioGeneration}, request={track.PlayRequestId}.");
+                    return;
+                }
+
+                _restoredSnapshotPendingResume = false;
+
+                var transitionResult = _applicationQueue.ObserveTrackChanged(
+                    track.Uri,
+                    track.PlayRequestId,
+                    track.SessionGeneration,
+                    DateTimeOffset.UtcNow);
+                LogApplicationQueueTransitionResult(transitionResult);
+
+                if (transitionResult?.RequiresCorrection == true)
+                {
+                    ApplicationQueueTransition correction;
+                    if (_applicationQueue.TryClaimFallback(
+                        transitionResult.QueueGenerationId,
+                        transitionResult.TransitionId,
+                        out correction))
+                    {
+                        LogService.Warn(
+                            $"[MediaService.OnTrackChanged] Rejecting native continuation {track.Uri}; " +
+                            $"the application context expects {correction.ExpectedUri}.");
+                        await CorrectUnexpectedApplicationQueueTrackAsync(correction).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        LogService.Info(
+                            $"[MediaService.OnTrackChanged] Ignoring unexpected native continuation {track.Uri}; " +
+                            "the pending end-of-queue operation will resolve it.");
+                    }
+                    return;
+                }
+
+                var queueSnapshot = _applicationQueue.Snapshot;
+                if (_offlineQueue.Length > 0 && queueSnapshot.CurrentIndex >= 0)
+                {
+                    _offlineQueueIndex = queueSnapshot.CurrentIndex;
+                    SetOnlineQueueResumePoint(
+                        FirstNonBlank(_offlineQueueContextUri, queueSnapshot.ContextUri),
+                        _offlineQueue,
+                        _offlineQueueIndex + 1);
+                }
+
                 UpdateState(state =>
                 {
                     state.Track = track;
                     state.Metadata = null;
-                    state.IsNarrationActive = false;
                     state.DurationMs = (uint)track.Duration.TotalMilliseconds;
                     state.IsTrackMetadataFromCache = false;
                     state.IsCurrentTrackPersisted = App.OfflineCatalog.IsTrackPersisted(track.Uri);
@@ -1682,7 +2579,7 @@ namespace LibreSpotUWP.Services
                     if (string.IsNullOrWhiteSpace(state.ContextName))
                         state.ContextName = ResolveImmediateContextName(state.ContextUri, null);
 
-                    if (_pendingRestoreSeekMs != uint.MaxValue &&
+                    if (HasPendingRestoreSeekFor(track.Uri) &&
                         _lastPlaybackSnapshot != null &&
                         string.Equals(_lastPlaybackSnapshot.TrackUri, track.Uri, StringComparison.OrdinalIgnoreCase))
                     {
@@ -1696,33 +2593,29 @@ namespace LibreSpotUWP.Services
                     }
                 });
 
+                _positionSynchronizer.Reset(Current.PositionMs);
+
                 UpdateSmtcDisplay();
                 PersistPlaybackSnapshot(forceWrite: true);
 
-                await EnsureRingPlayerAsync();
-                _ringPlayer?.PrepareForPlaybackStartLog(track.Uri);
-                LogService.Info($"[MediaService.OnTrackChanged] Prepared first audio frame marker for {track.Uri}.");
+                LogService.Info($"[MediaService.OnTrackChanged] Accepted track marker uri={track.Uri}, generation={track.AudioGeneration}, request={track.PlayRequestId}, preloaded={track.WasPreloaded}.");
 
-                if (TryConsumeEndOfTrackContinuation())
-                    SchedulePlaybackContinuationWatchdog(true, "end-of-track", allowStopped: true);
-
-                if (_pendingRestoreSeekMs != uint.MaxValue &&
-                    _lastPlaybackSnapshot != null &&
-                    string.Equals(_lastPlaybackSnapshot.TrackUri, track.Uri, StringComparison.OrdinalIgnoreCase))
+                uint seekPosition;
+                if (TryTakePendingRestoreSeek(track.Uri, out seekPosition))
                 {
-                    var seekPosition = _pendingRestoreSeekMs;
-                    _pendingRestoreSeekMs = uint.MaxValue;
                     if (seekPosition > 0)
-                        _librespot.Seek(seekPosition);
+                    {
+                        _ringPlayer.BeginTransition(
+                            "restore-seek",
+                            track.Uri,
+                            track.Uri,
+                            preserveCurrent: false,
+                            shouldPlay: true);
+                        await IssueSystemLibrespotSeekAsync(seekPosition).ConfigureAwait(false);
+                    }
 
                     ApplyPlaybackPosition(seekPosition, persistSnapshot: true);
                     PersistPlaybackSnapshot(forceWrite: true);
-                }
-
-                if (_state.PlaybackState == LibrespotPlaybackState.Playing)
-                {
-                    _mediaPlayer.Play();
-                    _ringPlayer.Start();
                 }
 
                 TryCompleteOnlineQueueRecovery(track.Uri);
@@ -1777,57 +2670,154 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        private async void OnPlaybackChanged(object sender, LibrespotPlaybackState state)
+        private async void OnPlaybackChanged(object sender, LibrespotPlaybackEvent playbackEvent)
         {
             try
             {
-                if (!IsSelectedSpotifyConnectDeviceLocal)
+                if (!IsSelectedSpotifyConnectDeviceLocal || playbackEvent == null)
                     return;
 
-                var previousState = _state.PlaybackState;
-                UpdateState(s => s.PlaybackState = state);
+                if (playbackEvent.SessionGeneration != _librespot.SessionGeneration)
+                {
+                    LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale session event. eventSessionGeneration={playbackEvent.SessionGeneration}, activeSessionGeneration={_librespot.SessionGeneration}.");
+                    return;
+                }
 
-                uint currentPos = _librespot.GetPositionMs();
-                ApplyPlaybackPosition(currentPos, persistSnapshot: state == LibrespotPlaybackState.Playing);
+                if (playbackEvent.IsAudioKeyUnavailable)
+                {
+                    HandleAudioKeyUnavailable(playbackEvent);
+                    return;
+                }
+
+                if (playbackEvent.IsUnavailable &&
+                    await TryHandleUnavailableApplicationQueueTrackAsync(playbackEvent).ConfigureAwait(false))
+                {
+                    return;
+                }
+
+                var state = playbackEvent.State;
+                var previousState = _state.PlaybackState;
+                uint currentPos = playbackEvent.PositionMs;
+
+                if (playbackEvent.IsSeek)
+                {
+                    await EnsureRingPlayerAsync();
+                    if (!_ringPlayer.ObserveSeek(playbackEvent.PlayRequestId, playbackEvent.AudioGeneration))
+                    {
+                        LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale seek generation={playbackEvent.AudioGeneration}, request={playbackEvent.PlayRequestId}.");
+                        return;
+                    }
+
+                    ApplyPlaybackPosition(currentPos, persistSnapshot: true);
+                    if (state == LibrespotPlaybackState.Playing &&
+                        await _ringPlayer.RequestPlaybackAsync(playbackEvent.PlayRequestId, playbackEvent.AudioGeneration))
+                    {
+                        UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Playing);
+                        if (_mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Playing)
+                            _mediaPlayer.Play();
+                        _smtc.PlaybackStatus = MediaPlaybackStatus.Playing;
+                    }
+                    return;
+                }
 
                 switch (state)
                 {
+                    case LibrespotPlaybackState.Loading:
+                        await EnsureRingPlayerAsync();
+                        if (!_ringPlayer.ObserveLoading(playbackEvent.PlayRequestId))
+                        {
+                            LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale Loading request={playbackEvent.PlayRequestId}.");
+                            return;
+                        }
+                        _positionSynchronizer.ObserveAuthoritative(
+                            currentPos,
+                            PlaybackPositionOrigin.StateTransition,
+                            isPlaying: false);
+                        UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Loading);
+                        ApplyPlaybackPosition(currentPos, persistSnapshot: false);
+                        break;
+
                     case LibrespotPlaybackState.Playing:
+                        Volatile.Write(ref _playbackRequested, 1);
                         _librespotTransportUnhealthy = false;
                         if (!string.IsNullOrWhiteSpace(_pendingOfflineLoadTrackUri))
                         {
                             _pendingOfflineLoadTrackUri = null;
                             Interlocked.Increment(ref _offlineLoadVersion);
                         }
-                        if (_pendingRestoreSeekMs != uint.MaxValue)
+                        uint seekPosition;
+                        if (TryTakePendingRestoreSeek(
+                            FirstNonBlank(playbackEvent.TrackUri, _state.Track?.Uri),
+                            out seekPosition))
                         {
-                            var seekPosition = _pendingRestoreSeekMs;
-                            _pendingRestoreSeekMs = uint.MaxValue;
                             if (seekPosition > 0)
-                                _librespot.Seek(seekPosition);
+                            {
+                                await EnsureRingPlayerAsync();
+                                _ringPlayer.BeginTransition(
+                                    "restore-seek",
+                                    _state.Track?.Uri,
+                                    _state.Track?.Uri,
+                                    preserveCurrent: false,
+                                    shouldPlay: true);
+                                await IssueSystemLibrespotSeekAsync(seekPosition).ConfigureAwait(false);
+                            }
 
                             ApplyPlaybackPosition(seekPosition, persistSnapshot: true);
                             PersistPlaybackSnapshot(forceWrite: true);
                         }
 
                         await EnsureRingPlayerAsync();
-                        if (previousState != LibrespotPlaybackState.Playing)
+                        if (!await _ringPlayer.RequestPlaybackAsync(
+                            playbackEvent.PlayRequestId,
+                            playbackEvent.AudioGeneration))
                         {
-                            _ringPlayer.PrepareForPlaybackStartLog(_state.Track?.Uri);
-                            LogService.Info($"[MediaService.OnPlaybackChanged] Playback entered Playing for {_state.Track?.Uri ?? "(unknown)"} at {currentPos}ms.");
+                            LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale PlaybackResumed generation={playbackEvent.AudioGeneration}, request={playbackEvent.PlayRequestId}.");
+                            return;
                         }
 
+                        _positionSynchronizer.ObserveAuthoritative(
+                            currentPos,
+                            PlaybackPositionOrigin.StateTransition,
+                            isPlaying: true);
+                        UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Playing);
+                        ApplyPlaybackPosition(currentPos, persistSnapshot: true);
                         if (_mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Playing)
                             _mediaPlayer.Play();
 
-                        _ringPlayer.Start();
-                        LogService.Info($"[MediaService.OnPlaybackChanged] MediaPlayer and AudioGraph started for {_state.Track?.Uri ?? "(unknown)"}.");
+                        LogService.Info($"[MediaService.OnPlaybackChanged] Playback published after pre-roll for {_state.Track?.Uri ?? "(unknown)"}, generation={playbackEvent.AudioGeneration}, request={playbackEvent.PlayRequestId}.");
                         _smtc.PlaybackStatus = MediaPlaybackStatus.Playing;
                         TryCompleteOnlineQueueRecovery(_state.Track?.Uri);
                         break;
 
                     case LibrespotPlaybackState.Paused:
-                        _ringPlayer?.Stop();
+                        if (_ringPlayer?.HasPendingTransition == true &&
+                            !_ringPlayer.IsEventForPendingTransition(
+                                playbackEvent.PlayRequestId,
+                                playbackEvent.AudioGeneration))
+                        {
+                            LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale pause while a newer PCM transition is pending. request={playbackEvent.PlayRequestId}.");
+                            break;
+                        }
+                        if (_ringPlayer != null &&
+                            !_ringPlayer.HasPendingTransition &&
+                            !_ringPlayer.IsEventForActiveGeneration(
+                                playbackEvent.PlayRequestId,
+                                playbackEvent.AudioGeneration))
+                        {
+                            LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale pause for a non-active PCM generation. request={playbackEvent.PlayRequestId}, generation={playbackEvent.AudioGeneration}.");
+                            break;
+                        }
+
+                        Volatile.Write(ref _playbackRequested, 0);
+
+                        _positionSynchronizer.ObserveAuthoritative(
+                            currentPos,
+                            PlaybackPositionOrigin.StateTransition,
+                            isPlaying: false);
+                        UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Paused);
+                        ApplyPlaybackPosition(currentPos, persistSnapshot: false);
+                        if (_ringPlayer != null)
+                            await _ringPlayer.PauseAsync();
 
                         if (_mediaPlayer.PlaybackSession.PlaybackState != MediaPlaybackState.Paused)
                             _mediaPlayer.Pause();
@@ -1837,7 +2827,33 @@ namespace LibreSpotUWP.Services
                         break;
 
                     case LibrespotPlaybackState.Stopped:
-                        _ringPlayer?.Stop();
+                        var hasPendingAudioTransition = _ringPlayer?.HasPendingTransition == true;
+                        if (hasPendingAudioTransition &&
+                            !_ringPlayer.IsEventForPendingTransition(
+                                playbackEvent.PlayRequestId,
+                                playbackEvent.AudioGeneration))
+                        {
+                            LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale stopped event while a newer PCM transition is pending. request={playbackEvent.PlayRequestId}.");
+                            break;
+                        }
+                        if (!hasPendingAudioTransition &&
+                            _ringPlayer != null &&
+                            !_ringPlayer.IsEventForActiveGeneration(
+                                playbackEvent.PlayRequestId,
+                                playbackEvent.AudioGeneration))
+                        {
+                            LogService.Info($"[MediaService.OnPlaybackChanged] Ignoring stale stopped event for a non-active PCM generation. request={playbackEvent.PlayRequestId}, generation={playbackEvent.AudioGeneration}.");
+                            break;
+                        }
+
+                        if (!hasPendingAudioTransition)
+                            _ringPlayer?.Stop();
+                        _positionSynchronizer.ObserveAuthoritative(
+                            currentPos,
+                            PlaybackPositionOrigin.StateTransition,
+                            isPlaying: false);
+                        UpdateState(s => s.PlaybackState = LibrespotPlaybackState.Stopped);
+                        ApplyPlaybackPosition(currentPos, persistSnapshot: false);
                         _mediaPlayer.Pause();
                         _smtc.PlaybackStatus = MediaPlaybackStatus.Stopped;
                         PersistPlaybackSnapshot(forceWrite: true);
@@ -1861,8 +2877,10 @@ namespace LibreSpotUWP.Services
                                 _ = ContinueDownloadedPlaybackAfterOnlineFailureAsync("online queue recovery lost connectivity");
                             }
                         }
-                        else if (previousState == LibrespotPlaybackState.Playing ||
+                        else if (!hasPendingAudioTransition &&
+                            (previousState == LibrespotPlaybackState.Playing ||
                             previousState == LibrespotPlaybackState.Loading)
+                        )
                         {
                             ScheduleOfflineStopRecovery("playback stopped while offline or unstable");
                         }
@@ -1871,35 +2889,108 @@ namespace LibreSpotUWP.Services
             }
             catch (Exception ex)
             {
-                LogService.Error(ex, $"[MediaService.OnPlaybackChanged] Unhandled error while processing playback state {state}");
+                LogService.Error(ex, $"[MediaService.OnPlaybackChanged] Unhandled error while processing playback state {playbackEvent?.State}");
             }
         }
 
-        private void OnNarrationChanged(object sender, LibrespotNarrationState narration)
+        private void HandleAudioKeyUnavailable(LibrespotPlaybackEvent playbackEvent)
         {
-            if (!IsSelectedSpotifyConnectDeviceLocal || narration == null ||
-                !string.Equals(narration.TrackUri, Current.Track?.Uri, StringComparison.OrdinalIgnoreCase))
+            Volatile.Write(ref _playbackRequested, 0);
+            _ringPlayer?.Stop();
+            _mediaPlayer?.Pause();
+            _positionSynchronizer.ObserveAuthoritative(
+                0,
+                PlaybackPositionOrigin.StateTransition,
+                isPlaying: false);
+            ApplyPlaybackPosition(0, persistSnapshot: false);
+            UpdateState(state =>
             {
-                return;
-            }
-
-            UpdateState(state => state.IsNarrationActive = narration.IsActive);
-            UpdateSmtcDisplay();
-            LogService.Info($"[MediaService.OnNarrationChanged] Spotify DJ narration {(narration.IsActive ? "started" : "ended")}.");
+                state.PlaybackState = LibrespotPlaybackState.Stopped;
+                state.StatusMessage = "Spotify rejected this account's audio key. This is a known Spotify/librespot compatibility issue.";
+            });
+            _smtc.PlaybackStatus = MediaPlaybackStatus.Stopped;
+            PersistPlaybackSnapshot(forceWrite: true);
+            LogService.Warn($"[MediaService.HandleAudioKeyUnavailable] Playback stopped without queue skipping. track={playbackEvent.TrackUri ?? "(unknown)"}, sessionGeneration={playbackEvent.SessionGeneration}.");
         }
 
-        private void OnPositionChanged(object sender, uint positionMs)
+        private async Task<bool> TryHandleUnavailableApplicationQueueTrackAsync(
+            LibrespotPlaybackEvent playbackEvent)
+        {
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var next = _applicationQueue.MarkPendingExpectedUnavailable(
+                    playbackEvent.TrackUri,
+                    playbackEvent.SessionGeneration,
+                    IsApplicationQueueTrackPlayable);
+                if (next == null)
+                    return false;
+
+                LogService.Warn($"[MediaService.TryHandleUnavailableApplicationQueueTrackAsync] Skipping unavailable track {playbackEvent.TrackUri}; next={next.ExpectedUri ?? "(end-of-queue)"}.");
+                if (string.IsNullOrWhiteSpace(next.ExpectedUri))
+                {
+                    var completed = _applicationQueue.CompleteWithoutTrack(
+                        next.QueueGenerationId,
+                        next.TransitionId,
+                        DateTimeOffset.UtcNow);
+                    LogApplicationQueueTransitionResult(completed);
+                    _ringPlayer?.Stop();
+                    _mediaPlayer?.Pause();
+                    UpdateState(state => state.PlaybackState = LibrespotPlaybackState.Stopped);
+                    return true;
+                }
+
+                ApplicationQueueTransition claimed;
+                if (_applicationQueue.TryClaimFallback(
+                    next.QueueGenerationId,
+                    next.TransitionId,
+                    out claimed))
+                {
+                    await LoadApplicationQueueFallbackCoreAsync(claimed).ConfigureAwait(false);
+                }
+                return true;
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private void OnPositionChanged(object sender, LibrespotPositionUpdate update)
         {
             try
             {
                 if (!IsSelectedSpotifyConnectDeviceLocal)
                     return;
 
-                ApplyPlaybackPosition(positionMs, persistSnapshot: _state.PlaybackState == LibrespotPlaybackState.Playing);
+                if (update.SessionGeneration != _librespot.SessionGeneration)
+                    return;
+
+                PlaybackPositionOrigin origin;
+                switch (update.Origin)
+                {
+                    case LibrespotPositionUpdateOrigin.SeekAcknowledgement:
+                        origin = PlaybackPositionOrigin.SeekAcknowledgement;
+                        break;
+                    case LibrespotPositionUpdateOrigin.PositionCorrection:
+                        origin = PlaybackPositionOrigin.LibrespotCorrection;
+                        break;
+                    default:
+                        origin = PlaybackPositionOrigin.LibrespotProgress;
+                        break;
+                }
+
+                // This handler runs on the native callback thread and deliberately
+                // performs no dispatcher work. The 4 Hz position timer publishes
+                // the latest monotonic estimate to MediaState and the UI.
+                _positionSynchronizer.ObserveAuthoritative(
+                    update.PositionMs,
+                    origin,
+                    _state.PlaybackState == LibrespotPlaybackState.Playing);
             }
             catch (Exception ex)
             {
-                LogService.Error(ex, $"[MediaService.OnPositionChanged] Unhandled error while processing position {positionMs}");
+                LogService.Error(ex, $"[MediaService.OnPositionChanged] Unhandled error while processing position {update.PositionMs}");
             }
         }
 
@@ -1907,8 +2998,32 @@ namespace LibreSpotUWP.Services
         {
             try
             {
-                if (ev != null && !ev.IsConnected)
+                if (ev == null || ev.SessionGeneration != _librespot.SessionGeneration)
+                {
+                    LogService.Info($"[MediaService.OnSessionStateChanged] Ignoring stale session event. eventSessionGeneration={ev?.SessionGeneration ?? 0}, activeSessionGeneration={_librespot.SessionGeneration}.");
+                    return;
+                }
+
+                if (ev.IsConnected &&
+                    Interlocked.Exchange(ref _applicationQueueSessionGeneration, ev.SessionGeneration) != ev.SessionGeneration)
+                {
+                    var queueGeneration = _applicationQueue.RebaseForReconnect(ev.SessionGeneration);
+                    LogService.Info($"[MediaService.OnSessionStateChanged] Rebased application queue after reconnect. queueGeneration={queueGeneration}, sessionGeneration={ev.SessionGeneration}.");
+                }
+
+                // Native session activation is authoritative. Spotify's Web
+                // API may still report the prior device for a few seconds;
+                // waiting for that snapshot caused the following local
+                // PlaybackResumed event to be discarded as remote playback.
+                if (ev.IsConnected)
+                    AdoptLocalSpotifyConnectSession();
+
+                _ringPlayer?.SetSessionState(ev.IsConnected, ev.SessionGeneration);
+                if (!ev.IsConnected)
+                {
                     _librespotTransportUnhealthy = true;
+                    _ringPlayer?.ReportTransportFailure(ev.SessionGeneration, "session-disconnected");
+                }
 
                 UpdateState(s =>
                 {
@@ -1943,7 +3058,10 @@ namespace LibreSpotUWP.Services
             if (!IsSelectedSpotifyConnectDeviceLocal)
                 return;
 
-            _pendingVolume = volume;
+            if (Volatile.Read(ref _volumeVersion) != Volatile.Read(ref _volumeAppliedVersion))
+                return;
+
+            Volatile.Write(ref _pendingVolume, volume);
             UpdateState(s => s.Volume = volume);
 
             var settings = Windows.Storage.ApplicationData.Current.LocalSettings;
@@ -1957,6 +3075,8 @@ namespace LibreSpotUWP.Services
                 return;
 
             UpdateState(s => s.Shuffle = enabled);
+            _applicationQueue.UpdateShuffle(enabled);
+            SyncSmtcShuffle(enabled);
         }
 
         private void OnRepeatChanged(object sender, uint mode)
@@ -1965,24 +3085,230 @@ namespace LibreSpotUWP.Services
                 return;
 
             UpdateState(s => s.RepeatMode = (int)mode);
+            _applicationQueue.UpdateRepeatMode((int)mode);
+            SyncSmtcRepeat(mode);
         }
 
-        private void OnAuthChanged(object sender, AuthState auth)
+        private void SyncSmtcShuffle(bool enabled)
+        {
+            try
+            {
+                if (_smtc != null)
+                    _smtc.ShuffleEnabled = enabled;
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaService.SyncSmtcShuffle] Unable to sync shuffle state: {ex.Message}");
+            }
+        }
+
+        private void SyncSmtcRepeat(uint mode)
+        {
+            try
+            {
+                if (_smtc != null)
+                    _smtc.AutoRepeatMode = ToAutoRepeatMode(mode);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaService.SyncSmtcRepeat] Unable to sync repeat state: {ex.Message}");
+            }
+        }
+
+        private static MediaPlaybackAutoRepeatMode ToAutoRepeatMode(uint mode)
+        {
+            switch (mode)
+            {
+                case 1:
+                    return MediaPlaybackAutoRepeatMode.List;
+                case 2:
+                    return MediaPlaybackAutoRepeatMode.Track;
+                default:
+                    return MediaPlaybackAutoRepeatMode.None;
+            }
+        }
+
+        private static int ToLibrespotRepeatMode(MediaPlaybackAutoRepeatMode mode)
+        {
+            switch (mode)
+            {
+                case MediaPlaybackAutoRepeatMode.List:
+                    return 1;
+                case MediaPlaybackAutoRepeatMode.Track:
+                    return 2;
+                default:
+                    return 0;
+            }
+        }
+
+        private async void OnSmtcShuffleReceived(
+            MediaPlaybackCommandManager sender,
+            MediaPlaybackCommandManagerShuffleReceivedEventArgs args)
+        {
+            var deferral = args.GetDeferral();
+            try
+            {
+                args.Handled = true;
+                await SetShuffleAsync(args.IsShuffleRequested).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                SyncSmtcShuffle(Current.Shuffle);
+                LogService.Warn($"[MediaService.OnSmtcShuffleReceived] Shuffle request failed: {ex.Message}");
+            }
+            finally
+            {
+                deferral.Complete();
+            }
+        }
+
+        private async void OnSmtcAutoRepeatModeReceived(
+            MediaPlaybackCommandManager sender,
+            MediaPlaybackCommandManagerAutoRepeatModeReceivedEventArgs args)
+        {
+            var deferral = args.GetDeferral();
+            try
+            {
+                args.Handled = true;
+                await SetRepeatAsync(ToLibrespotRepeatMode(args.AutoRepeatMode)).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                SyncSmtcRepeat((uint)Current.RepeatMode);
+                LogService.Warn($"[MediaService.OnSmtcAutoRepeatModeReceived] Repeat request failed: {ex.Message}");
+            }
+            finally
+            {
+                deferral.Complete();
+            }
+        }
+
+        private void OnPlaybackAuthChanged(object sender, PlaybackAuthState authorization)
         {
             if (!ConnectivityHelper.HasInternetAccess())
                 return;
 
-            if (auth == null || auth.IsExpired || string.IsNullOrEmpty(auth.AccessToken))
+            if (authorization == null ||
+                authorization.Status == PlaybackAuthorizationStatus.Missing ||
+                authorization.Status == PlaybackAuthorizationStatus.Rejected)
                 return;
 
             if ((_librespot as LibrespotService)?.HasInstance == true)
                 return;
 
-            _ = ConnectAfterAuthChangedAsync(auth.AccessToken);
+            _ = ConnectAfterPlaybackAuthChangedAsync();
+        }
+
+        private async void OnPlaybackCredentialsAvailable(object sender, PlaybackCredentialsEventArgs args)
+        {
+            var dispatcher = Window.Current?.Dispatcher;
+            try
+            {
+                await _playbackAuth
+                    .SaveReusableCredentialsAsync(args.CredentialsJson, args.SessionUser)
+                    .ConfigureAwait(false);
+                LogService.Info("[MediaService.OnPlaybackCredentialsAvailable] Reusable playback authorization saved securely.");
+            }
+            catch (Exception ex)
+            {
+                LogService.Error(ex, "[MediaService.OnPlaybackCredentialsAvailable] Unable to retain playback authorization");
+                try
+                {
+                    await _playbackAuth.MarkRejectedAsync().ConfigureAwait(false);
+                    await _librespot.DisconnectAsync().ConfigureAwait(false);
+                    if (dispatcher != null)
+                    {
+                        await dispatcher.RunAsync(
+                            CoreDispatcherPriority.Normal,
+                            () => _ = PlaybackAuthorizationDialog.ShowIfNeededAsync(force: true));
+                    }
+                }
+                catch (Exception cleanupError)
+                {
+                    LogService.Error(cleanupError, "[MediaService.OnPlaybackCredentialsAvailable] Rejection cleanup failed");
+                }
+            }
+        }
+
+        private async void OnPlaybackAuthorizationRejected(object sender, EventArgs args)
+        {
+            var dispatcher = Window.Current?.Dispatcher;
+            try
+            {
+                await _playbackAuth.MarkRejectedAsync().ConfigureAwait(false);
+                await _librespot.DisconnectAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaService.OnPlaybackAuthorizationRejected] Cleanup failed: {ex.Message}");
+            }
+            finally
+            {
+                UpdateState(state =>
+                {
+                    state.PlaybackState = LibrespotPlaybackState.Stopped;
+                    state.StatusMessage = "Spotify playback authorization expired. Open Account settings to authorize playback again.";
+                });
+
+                try
+                {
+                    if (dispatcher != null)
+                    {
+                        await dispatcher.RunAsync(
+                            CoreDispatcherPriority.Normal,
+                            () => _ = PlaybackAuthorizationDialog.ShowIfNeededAsync(force: true));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogService.Warn($"[MediaService.OnPlaybackAuthorizationRejected] Unable to show recovery dialog: {ex.Message}");
+                }
+            }
+        }
+
+        private async void OnPlaybackAccountUnsupported(object sender, EventArgs args)
+        {
+            var dispatcher = Window.Current?.Dispatcher;
+            try
+            {
+                await _playbackAuth.MarkRejectedAsync().ConfigureAwait(false);
+                await _librespot.DisconnectAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaService.OnPlaybackAccountUnsupported] Cleanup failed: {ex.Message}");
+            }
+            finally
+            {
+                UpdateState(state =>
+                {
+                    state.PlaybackState = LibrespotPlaybackState.Stopped;
+                    state.StatusMessage = "The account selected for playback is not Spotify Premium. Authorize playback again with the same Premium account used for your library.";
+                });
+
+                try
+                {
+                    if (dispatcher != null)
+                    {
+                        await dispatcher.RunAsync(
+                            CoreDispatcherPriority.Normal,
+                            () => _ = PremiumRequiredDialog.ShowAsync(
+                                new SpotifyPremiumRequiredException("free")));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogService.Warn($"[MediaService.OnPlaybackAccountUnsupported] Unable to show Premium account warning: {ex.Message}");
+                }
+            }
         }
 
         private void OnLibrespotLogMessage(object sender, string message)
         {
+            var applicationQueueFailure = GetApplicationQueueFailureReason(message);
+            if (applicationQueueFailure != null)
+                _applicationQueue.RecordInternalQueueFailure(applicationQueueFailure);
+
             if (!IsMediaConnectivityFailure(message))
                 return;
 
@@ -1995,6 +3321,10 @@ namespace LibreSpotUWP.Services
                 LogService.Info("[MediaService.OnLibrespotLogMessage] Ignoring media failure from offline substitute preload/state sync.");
                 return;
             }
+
+            _ringPlayer?.ReportTransportFailure(
+                _librespot.SessionGeneration,
+                GetTransportFailureReason(message));
 
             var enteredOfflineBackoff = ReportMediaConnectivityFailure("librespot media connectivity failure");
             MarkFailedDownloadedTrackFromLibrespotLog(message);
@@ -2030,7 +3360,269 @@ namespace LibreSpotUWP.Services
             return message.IndexOf("Audio key response timeout", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 message.IndexOf("Unable to load audio item", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 message.IndexOf("Streamer error requesting range", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                message.IndexOf("Connection to server closed", StringComparison.OrdinalIgnoreCase) >= 0;
+                message.IndexOf("Connection to server closed", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message.IndexOf("UnexpectedEof", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message.IndexOf("unexpected EOF", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message.IndexOf("incomplete stream", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message.IndexOf("incomplete body", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message.IndexOf("unexpected shutdown", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string GetApplicationQueueFailureReason(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return null;
+            if (message.IndexOf("context is not available", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "spotify-context-unavailable";
+            if (message.IndexOf("collection-data", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                message.IndexOf("parsing", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "collection-data-parse-failed";
+            }
+            if (message.IndexOf("no more tracks left in queue", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "internal-librespot-queue-empty";
+            if (message.IndexOf("failed filling up next_track", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "internal-next-track-fill-failed";
+            return null;
+        }
+
+        private static string GetTransportFailureReason(string message)
+        {
+            if (message?.IndexOf("UnexpectedEof", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                message?.IndexOf("unexpected EOF", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "unexpected-eof";
+            }
+
+            if (message?.IndexOf("incomplete", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "incomplete-stream";
+            if (message?.IndexOf("Connection to server closed", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "connection-closed";
+            if (message?.IndexOf("unexpected shutdown", StringComparison.OrdinalIgnoreCase) >= 0)
+                return "unexpected-shutdown";
+
+            return "stream-failure";
+        }
+
+        private void OnProducerStalled(object sender, ProducerStalledEventArgs args)
+        {
+            if (args == null ||
+                Volatile.Read(ref _disposed) != 0 ||
+                Volatile.Read(ref _suspended) != 0 ||
+                Volatile.Read(ref _producerRecoveryBlocked) != 0 ||
+                !IsSelectedSpotifyConnectDeviceLocal ||
+                !ReferenceEquals(sender, _ringPlayer) ||
+                args.GraphInstanceId != _ringPlayer?.GraphInstanceId ||
+                args.SessionGeneration != _librespot.SessionGeneration ||
+                (Current.PlaybackState != LibrespotPlaybackState.Playing &&
+                 Current.PlaybackState != LibrespotPlaybackState.Loading))
+            {
+                return;
+            }
+
+            _ = RunRequestedProducerRecoveryAsync(args);
+        }
+
+        private async Task RunRequestedProducerRecoveryAsync(ProducerStalledEventArgs args)
+        {
+            try
+            {
+                await _producerRecovery.RunAsync(
+                    cancellationToken => RecoverProducerAsync(args, cancellationToken),
+                    _lifetimeCancellation.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                LogService.Info($"[MediaService.RecoverProducerAsync] Recovery cancelled. graphId={args.GraphInstanceId}, sessionGeneration={args.SessionGeneration}.");
+            }
+            catch (Exception ex)
+            {
+                LogService.Error(ex, $"[MediaService.RecoverProducerAsync] Unhandled recovery failure. graphId={args.GraphInstanceId}, sessionGeneration={args.SessionGeneration}");
+            }
+        }
+
+        private async Task RecoverProducerAsync(
+            ProducerStalledEventArgs trigger,
+            CancellationToken cancellationToken)
+        {
+            string trackUri = Current.Track?.Uri ?? _playbackIntent?.StartUri;
+            string contextUri = _playbackIntent?.ContextUri ?? Current.ContextUri;
+            uint positionMs = ClampPlaybackPosition(Current.PositionMs);
+            if (string.IsNullOrWhiteSpace(trackUri))
+            {
+                LogService.Warn("[MediaService.RecoverProducerAsync] No current track is available to recover.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(contextUri))
+                contextUri = trackUri;
+
+            Exception lastFailure = null;
+            for (int attempt = 1; attempt <= MaxProducerRecoveryAttempts; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int delayMs = BoundedRecoveryBackoff.GetDelayMilliseconds(attempt);
+                if (delayMs > 0)
+                    await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+
+                bool gateAcquired = false;
+                bool ringPlayerGateAcquired = false;
+                try
+                {
+                    await _playbackGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    gateAcquired = true;
+                    await _ringPlayerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    ringPlayerGateAcquired = true;
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (Volatile.Read(ref _suspended) != 0 ||
+                        Volatile.Read(ref _disposed) != 0 ||
+                        !IsSelectedSpotifyConnectDeviceLocal)
+                    {
+                        return;
+                    }
+
+                    var player = _ringPlayer;
+                    if (player == null || player.GraphInstanceId != trigger.GraphInstanceId)
+                        return;
+
+                    var accessToken = await _auth.EnsureValidAccessTokenAsync(interactive: false).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (string.IsNullOrWhiteSpace(accessToken))
+                        throw new InvalidOperationException("No access token is available for producer recovery.");
+                    var playbackAuthorization = await _playbackAuth.GetConnectionMaterialAsync().ConfigureAwait(false);
+                    if (playbackAuthorization == null || playbackAuthorization.IsEmpty)
+                        throw new InvalidOperationException("Spotify playback authorization is required for producer recovery.");
+
+                    LogService.Warn($"[MediaService.RecoverProducerAsync] Starting attempt={attempt}/{MaxProducerRecoveryAttempts}, graphId={player.GraphInstanceId}, failedSessionGeneration={trigger.SessionGeneration}, reason={trigger.Reason}, track={trackUri}, positionMs={positionMs}.");
+                    player.BeginTransition(
+                        "producer-recovery",
+                        trackUri,
+                        trackUri,
+                        preserveCurrent: false,
+                        shouldPlay: true);
+                    UpdateState(state =>
+                    {
+                        state.PlaybackState = LibrespotPlaybackState.Loading;
+                        state.StatusMessage = "Spotify playback stalled. Reconnecting…";
+                    });
+
+                    await _librespot.ReconnectWithPlaybackAuthAsync(playbackAuthorization).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    long replacementSessionGeneration = _librespot.SessionGeneration;
+                    var replacementSession = _librespot.Session;
+                    player.SetSessionState(
+                        replacementSession.IsConnected &&
+                        replacementSession.SessionGeneration == replacementSessionGeneration,
+                        replacementSessionGeneration);
+
+                    if (!await WaitForSessionGenerationConnectedAsync(
+                        replacementSessionGeneration,
+                        cancellationToken).ConfigureAwait(false))
+                    {
+                        throw new TimeoutException($"Session generation {replacementSessionGeneration} did not connect.");
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+                    SetPendingRestoreSeek(positionMs, trackUri);
+                    string startUri = string.Equals(contextUri, trackUri, StringComparison.OrdinalIgnoreCase)
+                        ? null
+                        : trackUri;
+                    await _librespot.LoadAndPlayAsync(contextUri, startUri).ConfigureAwait(false);
+
+                    if (player is LibrespotRingBufferPlayer ringPlayer &&
+                        !await WaitForProducerProgressAsync(
+                            ringPlayer,
+                            replacementSessionGeneration,
+                            cancellationToken).ConfigureAwait(false))
+                    {
+                        throw new TimeoutException("The replacement session connected but produced no PCM.");
+                    }
+
+                    _librespotTransportUnhealthy = false;
+                    Interlocked.Exchange(ref _producerRecoveryBlocked, 0);
+                    UpdateState(state => state.StatusMessage = null);
+                    LogService.Info($"[MediaService.RecoverProducerAsync] Recovery succeeded. attempt={attempt}, graphId={player.GraphInstanceId}, sessionGeneration={replacementSessionGeneration}, track={trackUri}, positionMs={positionMs}.");
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastFailure = ex;
+                    _librespotTransportUnhealthy = true;
+                    LogService.Warn($"[MediaService.RecoverProducerAsync] Attempt {attempt}/{MaxProducerRecoveryAttempts} failed: {ex.Message}");
+                }
+                finally
+                {
+                    if (ringPlayerGateAcquired)
+                        _ringPlayerGate.Release();
+                    if (gateAcquired)
+                        _playbackGate.Release();
+                }
+            }
+
+            Interlocked.Exchange(ref _producerRecoveryBlocked, 1);
+            _ringPlayer?.Stop();
+            _mediaPlayer?.Pause();
+            UpdateState(state =>
+            {
+                state.PlaybackState = LibrespotPlaybackState.Paused;
+                state.StatusMessage = "Spotify playback could not reconnect. Press Play to try again.";
+            });
+            LogService.Warn($"[MediaService.RecoverProducerAsync] Recovery exhausted after {MaxProducerRecoveryAttempts} attempts. graphId={trigger.GraphInstanceId}, track={trackUri}, lastFailure={lastFailure?.Message ?? "unknown"}.");
+        }
+
+        private async Task<bool> WaitForSessionGenerationConnectedAsync(
+            long sessionGeneration,
+            CancellationToken cancellationToken)
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            while (DateTimeOffset.UtcNow - startedAt < LocalSessionConnectTimeout)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_librespot.SessionGeneration != sessionGeneration)
+                    return false;
+                if (_librespot.Session.IsConnected &&
+                    _librespot.Session.SessionGeneration == sessionGeneration)
+                {
+                    return true;
+                }
+
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+
+            return false;
+        }
+
+        private static async Task<bool> WaitForProducerProgressAsync(
+            LibrespotRingBufferPlayer player,
+            long sessionGeneration,
+            CancellationToken cancellationToken)
+        {
+            var startedAt = DateTimeOffset.UtcNow;
+            while (DateTimeOffset.UtcNow - startedAt < ProducerRecoveryVerificationTimeout)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var health = player.GetProducerHealthSnapshot();
+                if (health.SessionGeneration != sessionGeneration)
+                    return false;
+                if (health.LastPcmWriteMs > 0 && health.LastSuccessfulStreamReadMs > 0)
+                    return true;
+
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+
+            return false;
+        }
+
+        private void CancelProducerRecovery(bool resetAttemptBudget)
+        {
+            _producerRecovery.CancelActive();
+            if (resetAttemptBudget)
+                Interlocked.Exchange(ref _producerRecoveryBlocked, 0);
         }
 
         private void MarkFailedDownloadedTrackFromLibrespotLog(string message)
@@ -2060,15 +3652,23 @@ namespace LibreSpotUWP.Services
             LogService.Warn($"[MediaService.MarkFailedDownloadedTrackFromLibrespotLog] Excluding failed downloaded track for this session: {trackUri}");
         }
 
-        private async Task ConnectAfterAuthChangedAsync(string accessToken)
+        private async Task ConnectAfterPlaybackAuthChangedAsync()
         {
+            CancelPlaybackContinuationWatchdog();
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                await _librespot.ConnectWithAccessTokenAsync(accessToken);
+                var authorization = await _playbackAuth.GetConnectionMaterialAsync().ConfigureAwait(false);
+                if (authorization != null && !authorization.IsEmpty)
+                    await _librespot.ConnectWithPlaybackAuthAsync(authorization).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                LogService.Warn($"[MediaService.OnAuthChanged] Unable to reconnect librespot after auth changed: {ex.Message}");
+                LogService.Warn($"[MediaService.OnPlaybackAuthChanged] Unable to reconnect librespot after playback authorization changed: {ex.Message}");
+            }
+            finally
+            {
+                _playbackGate.Release();
             }
         }
 
@@ -2137,71 +3737,261 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        private async void OnEndOfTrack(object sender, string trackUri)
+        private void OnEndOfTrack(object sender, LibrespotTrackBoundaryInfo boundary)
         {
-            LogService.Info($"[MediaService.OnEndOfTrack] Received end-of-track for {trackUri ?? "(unknown)"}.");
+            if (boundary == null || boundary.SessionGeneration != _librespot.SessionGeneration)
+                return;
+
+            LogService.Info($"[MediaService.OnEndOfTrack] Received end-of-track for {boundary.TrackUri ?? "(unknown)"}, request={boundary.PlayRequestId}, sessionGeneration={boundary.SessionGeneration}.");
             UpdateConnectivityState();
-            var shouldContinuePlaying = Current.PlaybackState == LibrespotPlaybackState.Playing
-                || Current.PlaybackState == LibrespotPlaybackState.Loading;
+            var shouldContinuePlaying = Volatile.Read(ref _playbackRequested) != 0;
+            var transition = _applicationQueue.BeginEndOfTrack(
+                boundary.TrackUri,
+                boundary.PlayRequestId,
+                boundary.SessionGeneration,
+                DateTimeOffset.UtcNow,
+                IsApplicationQueueTrackPlayable);
 
-            if (ConnectivityHelper.HasNetworkReportedInternetAccess() &&
-                HasOnlineQueueResumePoint())
+            if (!transition.IsValid)
             {
-                ConnectivityHelper.ClearInternetAccessFailure(force: true);
-                _onlineQueueRecoveryPending = true;
-                UpdateConnectivityState(isOfflineOverride: false);
-                if (TryResumeOnlineQueueFromOfflineBoundary(shouldContinuePlaying))
-                    return;
-            }
-
-            if (TryPlayOfflineRelativeTrack(1))
-            {
-                SchedulePlaybackContinuationWatchdog(shouldContinuePlaying, "offline end-of-track", allowStopped: true);
+                LogService.Info($"[MediaService.OnEndOfTrack] Ignoring {transition.FailureReason}; queueGeneration={transition.QueueGenerationId}.");
                 return;
             }
 
-            if (!Current.IsOffline && TryResumeOnlineQueueFromOfflineBoundary(shouldContinuePlaying))
+            _ringPlayer?.BeginAutomaticTransition(boundary.TrackUri, shouldContinuePlaying);
+            _ = CompleteApplicationQueueTransitionAsync(transition, shouldContinuePlaying);
+        }
+
+        private void OnTimeToPreloadNextTrack(object sender, LibrespotTrackBoundaryInfo boundary)
+        {
+            if (boundary == null || boundary.SessionGeneration != _librespot.SessionGeneration)
                 return;
 
-            if (Current.IsOffline && _offlineQueue.Length > 0)
+            var transition = _applicationQueue.ObservePreloadRequested(
+                boundary.TrackUri,
+                boundary.PlayRequestId,
+                boundary.SessionGeneration,
+                IsApplicationQueueTrackPlayable);
+            if (!transition.IsValid)
+                return;
+
+            LogService.Info($"[MediaService.OnTimeToPreloadNextTrack] queueGeneration={transition.QueueGenerationId}, transition={transition.TransitionId}, expected={transition.ExpectedUri ?? "(end-of-queue)"}.");
+        }
+
+        private void OnTrackPreloading(object sender, LibrespotTrackBoundaryInfo boundary)
+        {
+            if (boundary == null || boundary.SessionGeneration != _librespot.SessionGeneration)
+                return;
+
+            var matched = _applicationQueue.ObservePreloaded(boundary.TrackUri, boundary.SessionGeneration);
+            LogService.Info($"[MediaService.OnTrackPreloading] uri={boundary.TrackUri ?? "(unknown)"}, matchesApplicationQueue={matched}.");
+        }
+
+        private async Task CompleteApplicationQueueTransitionAsync(
+            ApplicationQueueTransition transition,
+            bool shouldContinuePlaying)
+        {
+            await Task.Delay(EndOfQueueGracePeriod).ConfigureAwait(false);
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
+            try
             {
-                var isPersistedContextQueue = ShouldKeepPersistedOfflineContextQueue();
-                if (!isPersistedContextQueue &&
-                    await TryPlayRandomOfflineFallbackAsync("no downloaded continuation is available in the current queue"))
+                if (Volatile.Read(ref _disposed) != 0 ||
+                    Volatile.Read(ref _suspended) != 0 ||
+                    !IsSelectedSpotifyConnectDeviceLocal)
                 {
                     return;
                 }
 
-                var hasKnownNextTrack = _offlineQueueIndex + 1 >= 0 && _offlineQueueIndex + 1 < _offlineQueue.Length;
-                if (shouldContinuePlaying &&
-                    hasKnownNextTrack &&
-                    !string.IsNullOrWhiteSpace(_offlineQueueContextUri))
+                if (string.IsNullOrWhiteSpace(transition.ExpectedUri))
                 {
-                    _waitingForOnlineQueueContinuation = true;
-                    var statusMessage = UserSettings.PlayDownloadedSongsDuringConnectionLoss
-                        ? "Offline. The next song is not downloaded, waiting for internet."
-                        : "Offline. Waiting for internet before continuing the queue.";
-                    LogService.Info($"[MediaService.OnEndOfTrack] No downloaded continuation is available from index {_offlineQueueIndex}; waiting for connectivity to return.");
-                    UpdateState(s =>
+                    if (Current.IsOffline && HasOnlineQueueResumePoint())
                     {
-                        s.PlaybackState = LibrespotPlaybackState.Paused;
-                        s.StatusMessage = statusMessage;
+                        var waiting = _applicationQueue.RetargetPendingExpected(
+                            _onlineQueueResumeStartUri,
+                            "next-track-not-available-offline");
+                        if (waiting != null)
+                        {
+                            ApplicationQueueTransition claimedWaiting;
+                            _applicationQueue.TryClaimFallback(
+                                waiting.QueueGenerationId,
+                                waiting.TransitionId,
+                                out claimedWaiting);
+                            SetWaitingForOnlineApplicationQueue(waiting.ExpectedUri);
+                            return;
+                        }
+                    }
+
+                    var completed = _applicationQueue.CompleteWithoutTrack(
+                        transition.QueueGenerationId,
+                        transition.TransitionId,
+                        DateTimeOffset.UtcNow);
+                    if (completed == null)
+                        return;
+
+                    _ringPlayer?.Stop();
+                    _mediaPlayer?.Pause();
+                    UpdateState(state =>
+                    {
+                        state.PlaybackState = LibrespotPlaybackState.Stopped;
+                        state.StatusMessage = Current.IsOffline ? "Offline queue finished." : null;
                     });
+                    if (_smtc != null)
+                        _smtc.PlaybackStatus = MediaPlaybackStatus.Stopped;
+                    LogApplicationQueueTransitionResult(completed);
                     return;
                 }
 
-                LogService.Info(isPersistedContextQueue
-                    ? "[MediaService.OnEndOfTrack] Persisted offline context queue reached the end."
-                    : "[MediaService.OnEndOfTrack] Offline queue reached the end.");
-                UpdateState(s =>
+                if (!shouldContinuePlaying)
                 {
-                    s.StatusMessage = "Offline queue finished.";
-                });
+                    LogApplicationQueueTransitionResult(_applicationQueue.CancelPendingTransition(
+                        "playback-no-longer-requested",
+                        DateTimeOffset.UtcNow));
+                    return;
+                }
+
+                ApplicationQueueTransition claimed;
+                if (!_applicationQueue.TryClaimFallback(
+                    transition.QueueGenerationId,
+                    transition.TransitionId,
+                    out claimed))
+                {
+                    return;
+                }
+
+
+                if (Current.IsOffline && !UserSettings.PlayDownloadedSongsDuringConnectionLoss)
+                {
+                    SetOnlineQueueResumeTrack(_applicationQueue.Snapshot.ContextUri, claimed.ExpectedUri);
+                    SetWaitingForOnlineApplicationQueue(claimed.ExpectedUri);
+                    return;
+                }
+
+                await LoadApplicationQueueFallbackCoreAsync(claimed).ConfigureAwait(false);
             }
-            else if (shouldContinuePlaying)
+            catch (Exception ex)
             {
-                ArmEndOfTrackContinuation();
+                LogService.Warn($"[MediaService.CompleteApplicationQueueTransitionAsync] Fallback failed: {ex.Message}");
+                LogApplicationQueueTransitionResult(_applicationQueue.CompleteWithoutTrack(
+                    transition.QueueGenerationId,
+                    transition.TransitionId,
+                    DateTimeOffset.UtcNow));
             }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private async Task LoadApplicationQueueFallbackCoreAsync(ApplicationQueueTransition transition)
+        {
+            LogService.Warn($"[MediaService.LoadApplicationQueueFallbackCoreAsync] Loading expected={transition.ExpectedUri}, queueGeneration={transition.QueueGenerationId}, transition={transition.TransitionId}, reason={transition.FailureReason}.");
+            await EnsureRingPlayerAsync().ConfigureAwait(false);
+            _ringPlayer.BeginTransition(
+                "application-queue-fallback",
+                Current.Track?.Uri,
+                transition.ExpectedUri,
+                preserveCurrent: false,
+                shouldPlay: true);
+            UpdateState(state => state.PlaybackState = LibrespotPlaybackState.Loading);
+            if (_mediaPlayer.PlaybackSession.PlaybackState == MediaPlaybackState.Playing)
+                _mediaPlayer.Pause();
+            ApplyPlaybackPosition(0, persistSnapshot: false);
+
+            if (Current.IsOffline)
+            {
+                _pendingOfflineLoadTrackUri = transition.ExpectedUri;
+                Interlocked.Increment(ref _offlineLoadVersion);
+            }
+
+            // librespot_load(..., play: true) is the only playback command used here.
+            // Calling Resume/Play as well races a player that may already be Playing.
+            var snapshot = _applicationQueue.Snapshot;
+            var contextUri = string.IsNullOrWhiteSpace(snapshot.ContextUri)
+                ? transition.ExpectedUri
+                : snapshot.ContextUri;
+            await _librespot.LoadAndPlayAsync(
+                contextUri,
+                transition.ExpectedUri,
+                snapshot.TrackUris).ConfigureAwait(false);
+        }
+
+        private async Task CorrectUnexpectedApplicationQueueTrackAsync(
+            ApplicationQueueTransition transition)
+        {
+            await _playbackGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (Volatile.Read(ref _disposed) != 0 ||
+                    Volatile.Read(ref _suspended) != 0 ||
+                    !IsSelectedSpotifyConnectDeviceLocal)
+                {
+                    return;
+                }
+
+                if (Volatile.Read(ref _playbackRequested) == 0)
+                {
+                    LogApplicationQueueTransitionResult(_applicationQueue.CancelPendingTransition(
+                        "playback-no-longer-requested",
+                        DateTimeOffset.UtcNow));
+                    return;
+                }
+
+                if (Current.IsOffline && !UserSettings.PlayDownloadedSongsDuringConnectionLoss)
+                {
+                    SetOnlineQueueResumeTrack(_applicationQueue.Snapshot.ContextUri, transition.ExpectedUri);
+                    SetWaitingForOnlineApplicationQueue(transition.ExpectedUri);
+                    return;
+                }
+
+                await LoadApplicationQueueFallbackCoreAsync(transition).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn(
+                    $"[MediaService.CorrectUnexpectedApplicationQueueTrackAsync] " +
+                    $"Unable to restore {transition.ExpectedUri}: {ex.Message}");
+                LogApplicationQueueTransitionResult(_applicationQueue.CompleteWithoutTrack(
+                    transition.QueueGenerationId,
+                    transition.TransitionId,
+                    DateTimeOffset.UtcNow));
+                _ringPlayer?.Stop();
+                _mediaPlayer?.Pause();
+                UpdateState(state => state.PlaybackState = LibrespotPlaybackState.Stopped);
+                if (_smtc != null)
+                    _smtc.PlaybackStatus = MediaPlaybackStatus.Stopped;
+            }
+            finally
+            {
+                _playbackGate.Release();
+            }
+        }
+
+        private void SetWaitingForOnlineApplicationQueue(string expectedUri)
+        {
+            _waitingForOnlineQueueContinuation = true;
+            UpdateState(state =>
+            {
+                state.PlaybackState = LibrespotPlaybackState.Paused;
+                state.StatusMessage = "Offline. Waiting for internet before continuing the queue.";
+            });
+            LogService.Info($"[MediaService.SetWaitingForOnlineApplicationQueue] Waiting to load {expectedUri} when connectivity returns.");
+        }
+
+        private bool IsApplicationQueueTrackPlayable(string trackUri)
+        {
+            if (!Current.IsOffline && ConnectivityHelper.HasInternetAccess())
+                return true;
+            return IsDownloadedTrackPlayableOffline(trackUri);
+        }
+
+        private static void LogApplicationQueueTransitionResult(ApplicationQueueTransitionResult result)
+        {
+            if (result == null)
+                return;
+            LogService.Info(
+                $"[MediaService.ApplicationQueueTransitionResult] expected={result.ExpectedNextUri}, preloaded={result.PreloadedUri}, " +
+                $"actual={result.ActualChangedUri}, fallback={result.FallbackUsed}, correction={result.RequiresCorrection}, failure={result.InternalQueueFailureReason}, " +
+                $"elapsedMs={result.ElapsedTransitionMilliseconds}, queueGeneration={result.QueueGenerationId}, transition={result.TransitionId}.");
         }
 
         private void UpdateConnectivityState(bool? isOfflineOverride = null)
@@ -2311,7 +4101,11 @@ namespace LibreSpotUWP.Services
             var contextUri = string.IsNullOrWhiteSpace(_offlineQueueContextUri)
                 ? _offlineQueue[_offlineQueueIndex]
                 : _offlineQueueContextUri;
-            _ = PlayAsync(contextUri, _offlineQueue[_offlineQueueIndex]);
+            _ = PlayAsync(
+                contextUri,
+                _offlineQueue[_offlineQueueIndex],
+                _offlineQueue,
+                _offlineQueueIndex);
             return true;
         }
 
@@ -2661,7 +4455,13 @@ namespace LibreSpotUWP.Services
                 s.StatusMessage = effectiveStatusMessage;
             });
 
-            _ringPlayer?.Stop();
+            await EnsureRingPlayerAsync().ConfigureAwait(false);
+            _ringPlayer.BeginTransition(
+                "offline-load",
+                Current.Track?.Uri,
+                trackUri,
+                preserveCurrent: false,
+                shouldPlay: true);
             if (_mediaPlayer.PlaybackSession.PlaybackState == MediaPlaybackState.Playing)
                 _mediaPlayer.Pause();
             ApplyPlaybackPosition(0, persistSnapshot: false);
@@ -2669,8 +4469,6 @@ namespace LibreSpotUWP.Services
             _pendingOfflineLoadTrackUri = trackUri;
             Interlocked.Increment(ref _offlineLoadVersion);
             await _librespot.LoadAndPlayAsync(trackUri, null).ConfigureAwait(false);
-            await EnsureRingPlayerAsync().ConfigureAwait(false);
-            _ringPlayer.Start();
             return true;
         }
 
@@ -2863,6 +4661,16 @@ namespace LibreSpotUWP.Services
             MediaStateChanged?.Invoke(this, snapshot);
         }
 
+        private void UpdateStateWithoutNotification(Action<MediaState> mutator)
+        {
+            lock (_lock)
+            {
+                var clone = _state.Clone();
+                mutator(clone);
+                _state = clone;
+            }
+        }
+
         private async Task RestorePlaybackSnapshotAsync()
         {
             if (!UserSettings.RememberLastPlaybackState)
@@ -2875,7 +4683,11 @@ namespace LibreSpotUWP.Services
             PlaybackSnapshot snapshot;
             try
             {
-                snapshot = JsonConvert.DeserializeObject<PlaybackSnapshot>(json);
+                snapshot = await Task.Run(() =>
+                {
+                    UiResponsivenessTelemetry.VerifyBackgroundThread("playback snapshot JSON parsing");
+                    return JsonConvert.DeserializeObject<PlaybackSnapshot>(json);
+                }).ConfigureAwait(true);
             }
             catch (Exception ex)
             {
@@ -2887,6 +4699,7 @@ namespace LibreSpotUWP.Services
                 return;
 
             _lastPlaybackSnapshot = snapshot;
+            _restoredSnapshotPendingResume = true;
             _lastPersistedSnapshotPositionMs = snapshot.PositionMs;
 
             var trackInfo = new LibrespotTrackInfo
@@ -2922,7 +4735,8 @@ namespace LibreSpotUWP.Services
 
             if (UserSettings.ResumeLastPlaybackIfWasPlaying && snapshot.WasPlaying)
             {
-                _pendingRestoreSeekMs = snapshot.PositionMs;
+                _restoredSnapshotPendingResume = false;
+                SetPendingRestoreSeek(snapshot.PositionMs, snapshot.TrackUri);
 
                 await PlayAsync(
                     string.IsNullOrWhiteSpace(snapshot.ContextUri) ? snapshot.TrackUri : snapshot.ContextUri,
@@ -2960,9 +4774,23 @@ namespace LibreSpotUWP.Services
                 if (!forceWrite && now - _lastSnapshotWriteAt < TimeSpan.FromMilliseconds(SnapshotWriteIntervalMs))
                     return;
 
-                Windows.Storage.ApplicationData.Current.LocalSettings.Values[PlaybackSnapshotKey] =
-                    JsonConvert.SerializeObject(snapshot);
                 _lastSnapshotWriteAt = now;
+                _snapshotWriteQueue.Post(() =>
+                {
+                    try
+                    {
+                        UiResponsivenessTelemetry.VerifyBackgroundThread("playback snapshot persistence");
+                        var json = JsonConvert.SerializeObject(snapshot);
+                        Windows.Storage.ApplicationData.Current.LocalSettings.Values[PlaybackSnapshotKey] = json;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogService.Telemetry(
+                            "playback-snapshot-write-failure",
+                            $"Unable to save playback snapshot: {ex.Message}",
+                            warning: true);
+                    }
+                });
             }
             catch (Exception ex)
             {
@@ -2978,12 +4806,15 @@ namespace LibreSpotUWP.Services
             var updater = _smtc.DisplayUpdater;
             updater.Type = MediaPlaybackType.Music;
 
-            updater.MusicProperties.Title = _state.DisplayTitle;
-            updater.MusicProperties.Artist = _state.DisplayArtist;
-            updater.MusicProperties.AlbumTitle = _state.DisplayAlbumTitle;
+            var t = _state.Metadata;
+            updater.MusicProperties.Title = t?.Name ?? _state.Track?.Name ?? string.Empty;
+            updater.MusicProperties.Artist = t != null
+                ? string.Join(", ", t.Artists?.Select(a => a.Name))
+                : _state.Track?.Artist ?? string.Empty;
+            updater.MusicProperties.AlbumTitle = t?.Album?.Name ?? _state.Track?.Album ?? string.Empty;
 
             updater.Thumbnail = null;
-            if (!_state.IsNarrationActive && TryCreateArtworkUri(_state.ArtworkUri, out var artworkUri))
+            if (TryCreateArtworkUri(_state.ArtworkUri, out var artworkUri))
                 updater.Thumbnail = RandomAccessStreamReference.CreateFromUri(artworkUri);
 
             updater.Update();
@@ -3147,19 +4978,37 @@ namespace LibreSpotUWP.Services
                 }
 
                 var accessToken = await _auth.EnsureValidAccessTokenAsync(interactive: false);
+                var playbackAuthorization = await _playbackAuth.GetConnectionMaterialAsync();
                 if (!string.IsNullOrWhiteSpace(accessToken) &&
+                    playbackAuthorization != null && !playbackAuthorization.IsEmpty &&
                     (!_librespot.Session.IsConnected || _librespotTransportUnhealthy))
                 {
-                    if (_librespotTransportUnhealthy)
+                    CancelPlaybackContinuationWatchdog();
+                    await _playbackGate.WaitAsync().ConfigureAwait(false);
+                    try
                     {
-                        LogService.Info("[MediaService.HandleNetworkStatusChangedAsync] Connectivity restored, recreating unhealthy librespot transport.");
-                        await _librespot.ReconnectWithAccessTokenAsync(accessToken).ConfigureAwait(false);
-                        _librespotTransportUnhealthy = false;
+                        if (_librespotTransportUnhealthy)
+                        {
+                            LogService.Info("[MediaService.HandleNetworkStatusChangedAsync] Connectivity restored, recreating unhealthy librespot transport.");
+                            _ringPlayer?.BeginTransition(
+                                "reconnect",
+                                Current.Track?.Uri,
+                                Current.Track?.Uri,
+                                preserveCurrent: false,
+                                shouldPlay: _state.PlaybackState == LibrespotPlaybackState.Playing ||
+                                    _state.PlaybackState == LibrespotPlaybackState.Loading);
+                            await _librespot.ReconnectWithPlaybackAuthAsync(playbackAuthorization).ConfigureAwait(false);
+                            _librespotTransportUnhealthy = false;
+                        }
+                        else
+                        {
+                            LogService.Info("[MediaService.HandleNetworkStatusChangedAsync] Connectivity restored, reconnecting librespot.");
+                            await _librespot.ConnectWithPlaybackAuthAsync(playbackAuthorization).ConfigureAwait(false);
+                        }
                     }
-                    else
+                    finally
                     {
-                        LogService.Info("[MediaService.HandleNetworkStatusChangedAsync] Connectivity restored, reconnecting librespot.");
-                        await _librespot.ConnectWithAccessTokenAsync(accessToken).ConfigureAwait(false);
+                        _playbackGate.Release();
                     }
 
                     if (App.OfflineCatalog != null)
@@ -3173,7 +5022,12 @@ namespace LibreSpotUWP.Services
                     if (!TryResumeOnlineQueueFromOfflineBoundary(shouldContinuePlaying: true))
                     {
                         _waitingForOnlineQueueContinuation = false;
-                        SchedulePlaybackContinuationWatchdog(shouldContinuePlaying: true, reason: "connectivity restored", allowStopped: true);
+                        var playbackState = Current.PlaybackState;
+                        if (playbackState == LibrespotPlaybackState.Paused ||
+                            playbackState == LibrespotPlaybackState.Stopped)
+                        {
+                            await ResumeAsync().ConfigureAwait(false);
+                        }
                     }
                 }
 
@@ -3292,7 +5146,8 @@ namespace LibreSpotUWP.Services
                 if (TryGetSpotifyUriId(contextUri, "spotify:album:", out var albumId))
                 {
                     var albumTracks = await _web.GetAlbumTracksAsync(albumId, false).ConfigureAwait(false);
-                    var trackUris = albumTracks?.Value?.Items?
+                    var albumItems = await GetAllPagingItemsAsync(albumTracks?.Value).ConfigureAwait(false);
+                    var trackUris = albumItems
                         .Select(track => track?.Uri)
                         .Where(IsSpotifyTrackUri)
                         .ToList();
@@ -3306,7 +5161,8 @@ namespace LibreSpotUWP.Services
                 else if (TryGetSpotifyUriId(contextUri, "spotify:playlist:", out var playlistId))
                 {
                     var playlistItems = await _web.GetPlaylistItemsAsync(playlistId, false).ConfigureAwait(false);
-                    var trackUris = playlistItems?.Value?.Items?
+                    var allPlaylistItems = await GetAllPagingItemsAsync(playlistItems?.Value).ConfigureAwait(false);
+                    var trackUris = allPlaylistItems
                         .Select(item => (item?.Track as FullTrack)?.Uri)
                         .Where(IsSpotifyTrackUri)
                         .ToList();
@@ -3314,6 +5170,20 @@ namespace LibreSpotUWP.Services
                     if (trackUris?.Count > 0)
                     {
                         LogService.Info($"[MediaService.GetKnownTrackUrisForPlaybackContextAsync] Loaded {trackUris.Count} known tracks for {contextUri} from {(playlistItems.IsOfflineFallback || playlistItems.IsFromCache ? "cached" : "live")} playlist metadata.");
+                        return trackUris;
+                    }
+                }
+                else if (string.Equals(contextUri, "spotify:collection:tracks", StringComparison.OrdinalIgnoreCase))
+                {
+                    var savedTracks = await _web.GetSavedTracksAsync(false).ConfigureAwait(false);
+                    var allSavedTracks = await GetAllPagingItemsAsync(savedTracks?.Value).ConfigureAwait(false);
+                    var trackUris = allSavedTracks
+                        .Select(item => item?.Track?.Uri)
+                        .Where(IsSpotifyTrackUri)
+                        .ToList();
+                    if (trackUris?.Count > 0)
+                    {
+                        LogService.Info($"[MediaService.GetKnownTrackUrisForPlaybackContextAsync] Loaded {trackUris.Count} liked-song URIs from {(savedTracks.IsOfflineFallback || savedTracks.IsFromCache ? "cache" : "Spotify")}.");
                         return trackUris;
                     }
                 }
@@ -3327,6 +5197,25 @@ namespace LibreSpotUWP.Services
                 return new[] { contextUri };
 
             return Array.Empty<string>();
+        }
+
+        private async Task<IReadOnlyList<T>> GetAllPagingItemsAsync<T>(Paging<T> firstPage)
+        {
+            if (firstPage == null)
+                return Array.Empty<T>();
+
+            var items = new List<T>(firstPage.Items ?? new List<T>());
+            var page = firstPage;
+            while (!string.IsNullOrWhiteSpace(page.Next))
+            {
+                var response = await _web.GetNextPageAsync(page).ConfigureAwait(false);
+                page = response?.Value;
+                if (page == null)
+                    break;
+                if (page.Items != null)
+                    items.AddRange(page.Items);
+            }
+            return items;
         }
 
         private int FindPlayableOfflineQueueIndex(IReadOnlyList<string> queue, int currentIndex, int delta)
@@ -3441,10 +5330,10 @@ namespace LibreSpotUWP.Services
             if (!value.StartsWith(AppDataLocalUriPrefix, StringComparison.OrdinalIgnoreCase))
                 return value;
 
-            var relativePath = Uri.UnescapeDataString(value.Substring(AppDataLocalUriPrefix.Length))
-                .Replace('/', Path.DirectorySeparatorChar);
-            var localPath = Path.Combine(ApplicationData.Current.LocalFolder.Path, relativePath);
-            return File.Exists(localPath) ? value : null;
+            // OfflineCatalogService only commits this URI after its asynchronous
+            // image write succeeds. Avoid probing the filesystem from playback/UI
+            // event handlers; a missing cache file is handled by the image source.
+            return value;
         }
 
         private static string FirstNonBlank(params string[] values)
@@ -3536,6 +5425,74 @@ namespace LibreSpotUWP.Services
                 if (string.Equals(state.ContextUri, contextUri, StringComparison.OrdinalIgnoreCase))
                     state.ContextName = contextName;
             });
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            try { _lifetimeCancellation.Cancel(); } catch (ObjectDisposedException) { }
+            _producerRecovery.Dispose();
+            CancelPlaybackContinuationWatchdog();
+
+            NetworkInformation.NetworkStatusChanged -= OnNetworkStatusChanged;
+            ConnectivityHelper.InternetAccessFailureReported -= OnInternetAccessFailureReported;
+            ConnectivityHelper.ConnectivityStatusChanged -= OnConnectivityStatusChanged;
+            _playbackAuth.PlaybackAuthStateChanged -= OnPlaybackAuthChanged;
+            _librespot.TrackChanged -= OnTrackChanged;
+            _librespot.PlaybackEvent -= OnPlaybackChanged;
+            _librespot.PositionChanged -= OnPositionChanged;
+            _librespot.SessionStateChanged -= OnSessionStateChanged;
+            _librespot.VolumeChanged -= OnVolumeChanged;
+            _librespot.ShuffleChanged -= OnShuffleChanged;
+            _librespot.RepeatChanged -= OnRepeatChanged;
+
+            if (_mediaPlayer?.CommandManager != null)
+            {
+                _mediaPlayer.CommandManager.ShuffleReceived -= OnSmtcShuffleReceived;
+                _mediaPlayer.CommandManager.AutoRepeatModeReceived -= OnSmtcAutoRepeatModeReceived;
+            }
+
+            _librespot.EndOfTrack -= OnEndOfTrack;
+            _librespot.TimeToPreloadNextTrack -= OnTimeToPreloadNextTrack;
+            _librespot.TrackPreloading -= OnTrackPreloading;
+            _librespot.LogMessage -= OnLibrespotLogMessage;
+            _librespot.PlaybackCredentialsAvailable -= OnPlaybackCredentialsAvailable;
+            _librespot.PlaybackAuthorizationRejected -= OnPlaybackAuthorizationRejected;
+            _librespot.PlaybackAccountUnsupported -= OnPlaybackAccountUnsupported;
+            _playbackAuth.PlaybackAuthStateChanged -= OnPlaybackAuthChanged;
+
+            _positionTimer?.Stop();
+            _volumeDebounceTimer?.Stop();
+            _spotifyConnectTimer?.Stop();
+            if (_smtc != null)
+                _smtc.ButtonPressed -= OnSmtcButtonPressed;
+
+            _ = DisposeRingPlayerAsync();
+
+            _mediaPlayer?.Dispose();
+            _mediaPlayer = null;
+        }
+
+        private async Task DisposeRingPlayerAsync()
+        {
+            await _ringPlayerGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_ringPlayer != null)
+                {
+                    _ringPlayer.ProducerStalled -= OnProducerStalled;
+                    await _ringPlayer.DisposeAsync().ConfigureAwait(false);
+                    _ringPlayer = null;
+                }
+
+                LogService.Info($"[MediaService.Dispose] Media service disposed. sessionGeneration={_librespot.SessionGeneration}, liveGraphs={LibrespotRingBufferPlayer.LiveGraphCount}.");
+            }
+            finally
+            {
+                _ringPlayerGate.Release();
+            }
         }
     }
 }

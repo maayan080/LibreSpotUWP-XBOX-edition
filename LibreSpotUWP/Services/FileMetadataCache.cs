@@ -73,7 +73,11 @@ public sealed class FileMetadataCache : IMetadataCache
                     Data = fresh
                 };
 
-                var jsonOut = JsonConvert.SerializeObject(newEnvelope);
+                var jsonOut = await Task.Run(() =>
+                {
+                    LibreSpotUWP.Services.UiResponsivenessTelemetry.VerifyBackgroundThread("metadata JSON serialization");
+                    return JsonConvert.SerializeObject(newEnvelope);
+                }).ConfigureAwait(false);
 
                 var folder = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(folder))
@@ -133,14 +137,20 @@ public sealed class FileMetadataCache : IMetadataCache
         try
         {
             var json = await _fileSystem.ReadTextAsync(path);
-            var envelope = JsonConvert.DeserializeObject<CacheEnvelope<T>>(json);
+            var envelope = await Task.Run(() =>
+            {
+                LibreSpotUWP.Services.UiResponsivenessTelemetry.VerifyBackgroundThread("metadata JSON parsing");
+                return JsonConvert.DeserializeObject<CacheEnvelope<T>>(json);
+            }).ConfigureAwait(false);
 
             if (envelope == null)
                 return null;
 
-            var isStale = false;
-            if (evaluateStaleness && ttl != TimeSpan.Zero && ttl != TimeSpan.MaxValue)
-                isStale = DateTimeOffset.UtcNow - envelope.Timestamp >= ttl;
+            var isStale = evaluateStaleness &&
+                LibreSpotUWP.Services.CacheFreshness.IsStale(
+                    envelope.Timestamp,
+                    ttl,
+                    DateTimeOffset.UtcNow);
 
             return new CacheResponse<T>(envelope.Data, envelope.Timestamp, true, isStale);
         }

@@ -164,7 +164,7 @@
     <Compile Include="Helpers\ImageUriHelper.cs" />
     <Compile Include="Helpers\NowPlayingLyricsPresenter.cs" />
     <Compile Include="Helpers\PlaybackNavigationHelper.cs" />
-    <Compile Include="Helpers\SpotifyDjHelper.cs" />
+    <Compile Include="Helpers\StorageStatisticsHelper.cs" />
     <Compile Include="Helpers\UserSettings.cs" />
     <Compile Include="Helpers\UwpBackgroundExecutionManager.cs" />
     <Compile Include="Helpers\UwpSettingsNavigator.cs" />
@@ -181,19 +181,25 @@
     </Compile>
     <Compile Include="Converters\Converters.cs" />
     <Compile Include="Helpers\AudioFormatProbe.cs" />
+    <Compile Include="Helpers\AudioKeyCompatibilityWarning.cs" />
     <Compile Include="Helpers\BarcodeHelper.cs" />
     <Compile Include="Helpers\AppResetHelper.cs" />
     <Compile Include="Helpers\NavigationHelper.cs" />
     <Compile Include="Helpers\OSHelper.cs" />
     <Compile Include="Helpers\PremiumRequiredDialog.cs" />
+    <Compile Include="Helpers\PlaybackAuthorizationDialog.cs" />
+    <Compile Include="Helpers\PlaybackBrowserAuthorizationHelper.cs" />
     <Compile Include="Helpers\QrLoginHelper.cs" />
     <Compile Include="Helpers\SpotifyIdHelper.cs" />
+    <Compile Include="Helpers\SpotifyDjSupportHelper.cs" />
     <Compile Include="Models\CacheResponse.cs" />
+    <Compile Include="Models\BulkObservableCollection.cs" />
     <Compile Include="Interfaces\ISpotifyWebService.cs" />
     <Compile Include="Interfaces\IOfflineCatalogService.cs" />
     <Compile Include="Interfaces\IMetadataCache.cs" />
     <Compile Include="Interfaces\ILibrespotService.cs" />
     <Compile Include="Interfaces\ISpotifyAuthService.cs" />
+    <Compile Include="Interfaces\ISpotifyPlaybackAuthService.cs" />
     <Compile Include="Interfaces\IMediaService.cs" />
     <Compile Include="Interfaces\IAppShell.cs" />
     <Compile Include="Models\Enums.cs" />
@@ -201,8 +207,8 @@
       <DependentUpon>ScannerPage.xaml</DependentUpon>
     </Compile>
     <Compile Include="Models\MediaState.cs" />
-    <Compile Include="Models\LibrespotNarrationState.cs" />
     <Compile Include="Models\AudioOutputDeviceInfo.cs" />
+    <Compile Include="Models\AudioBackendKind.cs" />
     <Compile Include="Models\SpotifyConnectDeviceInfo.cs" />
     <Compile Include="Models\EqualizerBandRange.cs" />
     <Compile Include="Models\AppEntities.cs" />
@@ -211,9 +217,14 @@
     <Compile Include="Models\DownloadModels.cs" />
     <Compile Include="Models\OfflineCatalogModels.cs" />
     <Compile Include="Models\LibrespotPlaybackState.cs" />
+    <Compile Include="Models\LibrespotPlaybackEvent.cs" />
+    <Compile Include="Models\LibrespotTrackBoundaryInfo.cs" />
+    <Compile Include="Models\LibrespotPositionUpdate.cs" />
     <Compile Include="Models\LibrespotTrackInfo.cs" />
     <Compile Include="Models\LibrespotSessionState.cs" />
     <Compile Include="Models\AuthState.cs" />
+    <Compile Include="Models\LoginPackage.cs" />
+    <Compile Include="Models\PlaybackAuthState.cs" />
     <Compile Include="Interfaces\ISecureStorage.cs" />
     <Compile Include="Services\AppearanceService.cs" />
     <Compile Include="Services\AudioKeyCache.cs" />
@@ -221,9 +232,13 @@
     <Compile Include="Services\SecureStorage.cs" />
     <Compile Include="Exceptions\SpotifyWebExceptions.cs" />
     <Compile Include="Services\SpotifyAuthService.cs" />
+    <Compile Include="Services\PlaybackAccountIdentityValidator.cs" />
+    <Compile Include="Services\SpotifyPlaybackAuthService.cs" />
     <Compile Include="Services\FileMetadataCache.cs" />
     <Compile Include="Services\FileSystem.cs" />
     <Compile Include="Services\LogService.cs" />
+    <Compile Include="Services\ResponsivenessPrimitives.cs" />
+    <Compile Include="Services\UiResponsivenessTelemetry.cs" />
     <Compile Include="Services\LiveTileService.cs" />
     <Compile Include="Services\UpdateService.cs" />
     <Compile Include="Services\DownloadTrackerService.cs" />
@@ -233,7 +248,15 @@
     <Compile Include="Services\SpotifyWebService.cs" />
     <Compile Include="Services\MediaService.cs" />
     <Compile Include="Services\LibrespotService.cs" />
+    <Compile Include="Services\ILibrespotAudioPlayer.cs" />
     <Compile Include="Services\LibrespotRingBufferPlayer.cs" />
+    <Compile Include="Services\NativeWindowsAudioPlayer.cs" />
+    <Compile Include="Services\AudioTransitionStateMachine.cs" />
+    <Compile Include="Services\ApplicationPlaybackQueue.cs" />
+    <Compile Include="Services\PlaybackPositionSynchronizer.cs" />
+    <Compile Include="Services\PositionSeekInteraction.cs" />
+    <Compile Include="Services\SpotifyConnectTransferTracker.cs" />
+    <Compile Include="Services\PlaybackLifecycleCoordinator.cs" />
     <Compile Include="Interop\LibreSpot.cs" />
     <Compile Include="Interop\NativeProbe.cs" />
     <Compile Include="OobePage.xaml.cs">

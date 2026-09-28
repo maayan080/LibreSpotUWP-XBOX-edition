@@ -31,12 +31,15 @@ namespace LibreSpotUWP.Services
         private const int RecentSourceLimit = 20;
         private static readonly TimeSpan RecentRefreshInterval = TimeSpan.FromMinutes(20);
         private static readonly TimeSpan PlaylistRefreshInterval = TimeSpan.FromMinutes(30);
+        private static readonly TimeSpan ScheduledFallbackLifetime = TimeSpan.FromDays(30);
 
         private readonly IMediaService _media;
         private readonly ISpotifyAuthService _auth;
         private readonly ISpotifyWebService _web;
-        private readonly SemaphoreSlim _updateGate = new SemaphoreSlim(1, 1);
         private readonly object _refreshScheduleLock = new object();
+        private readonly RefreshRequestCoalescer _refreshRequests = new RefreshRequestCoalescer();
+        private readonly SemaphoreSlim _refreshWakeSignal = new SemaphoreSlim(0, 1);
+        private readonly SemaphoreSlim _tileUpdateGate = new SemaphoreSlim(1, 1);
         private readonly Random _random = new Random();
 
         private bool _initialized;
@@ -51,10 +54,16 @@ namespace LibreSpotUWP.Services
         private List<LiveTileItemSnapshot> _recentAlbums;
         private List<LiveTileItemSnapshot> _recentPlaylists;
         private List<LiveTileItemSnapshot> _userPlaylists;
-        private int _updateVersion;
-        private CancellationTokenSource _refreshDebounceCts;
-        private bool _queuedForceRecentRefresh;
-        private string _queuedRefreshReason;
+        private Task _refreshWorkerTask;
+        private string _lastOsContentSignature;
+        private int _osUpdateCount;
+        private int _coalescedRequestCount;
+        private int _unchangedSkipCount;
+        private long _mediaRevision;
+
+        public int OsUpdateCount => Volatile.Read(ref _osUpdateCount);
+        public int CoalescedRequestCount => Volatile.Read(ref _coalescedRequestCount);
+        public int UnchangedSkipCount => Volatile.Read(ref _unchangedSkipCount);
 
         public LiveTileService(
             IMediaService media,
@@ -64,17 +73,34 @@ namespace LibreSpotUWP.Services
             _media = media ?? throw new ArgumentNullException(nameof(media));
             _auth = auth ?? throw new ArgumentNullException(nameof(auth));
             _web = web ?? throw new ArgumentNullException(nameof(web));
-            _recentSongs = LoadItemsFromSettings(RecentTileSongsKey);
-            _recentArtists = LoadItemsFromSettings(RecentTileArtistsKey);
-            _recentAlbums = LoadItemsFromSettings(RecentTileAlbumsKey);
-            _recentPlaylists = LoadItemsFromSettings(RecentTilePlaylistsKey);
-            _userPlaylists = LoadItemsFromSettings(UserTilePlaylistsKey);
+            _recentSongs = new List<LiveTileItemSnapshot>();
+            _recentArtists = new List<LiveTileItemSnapshot>();
+            _recentAlbums = new List<LiveTileItemSnapshot>();
+            _recentPlaylists = new List<LiveTileItemSnapshot>();
+            _userPlaylists = new List<LiveTileItemSnapshot>();
         }
 
         public async Task InitializeAsync(bool isSignedIn)
         {
             if (_initialized)
                 return;
+
+            using (UiResponsivenessTelemetry.BeginOperation("LiveTile.Initialize"))
+            {
+                var cached = await Task.Run(() => new[]
+                {
+                    LoadItemsFromSettings(RecentTileSongsKey),
+                    LoadItemsFromSettings(RecentTileArtistsKey),
+                    LoadItemsFromSettings(RecentTileAlbumsKey),
+                    LoadItemsFromSettings(RecentTilePlaylistsKey),
+                    LoadItemsFromSettings(UserTilePlaylistsKey)
+                }).ConfigureAwait(true);
+                _recentSongs = cached[0];
+                _recentArtists = cached[1];
+                _recentAlbums = cached[2];
+                _recentPlaylists = cached[3];
+                _userPlaylists = cached[4];
+            }
 
             _initialized = true;
             _isSignedIn = isSignedIn;
@@ -89,7 +115,7 @@ namespace LibreSpotUWP.Services
             QueueRefresh(
                 forceRecentRefresh: isSignedIn && !ShouldShowNowPlaying(_lastMediaState),
                 reason: "launch",
-                delay: TimeSpan.FromSeconds(3));
+                delay: TimeSpan.Zero);
 
             await Task.CompletedTask;
         }
@@ -102,12 +128,36 @@ namespace LibreSpotUWP.Services
                 delay: TimeSpan.FromMilliseconds(250));
         }
 
+        public void RefreshAfterResuming()
+        {
+            QueueRefresh(
+                forceRecentRefresh: false,
+                reason: "resume",
+                delay: TimeSpan.Zero);
+        }
+
         public async Task PrepareForSuspendingAsync()
         {
-            CancelQueuedRefresh();
-            await RefreshTileAsync(
+            QueueRefresh(
                 forceRecentRefresh: _isSignedIn && !ShouldShowNowPlaying(_lastMediaState),
-                reason: "suspending").ConfigureAwait(false);
+                reason: "suspending",
+                delay: TimeSpan.Zero);
+            _refreshRequests.Expedite(DateTimeOffset.UtcNow);
+            Task worker;
+            lock (_refreshScheduleLock)
+                worker = _refreshWorkerTask;
+            if (worker != null)
+            {
+                var completed = await Task.WhenAny(worker, Task.Delay(TimeSpan.FromMilliseconds(1500)))
+                    .ConfigureAwait(false);
+                if (!ReferenceEquals(completed, worker))
+                {
+                    LogService.Telemetry(
+                        "live-tile-suspend-timeout",
+                        "Live-tile refresh remained queued at suspension; released the suspension deferral without blocking it.",
+                        warning: true);
+                }
+            }
         }
 
         public static string TryGetNavigationTagFromLaunchArguments(string arguments)
@@ -129,7 +179,7 @@ namespace LibreSpotUWP.Services
             return null;
         }
 
-        private async void OnMediaStateChanged(object sender, MediaState state)
+        private void OnMediaStateChanged(object sender, MediaState state)
         {
             try
             {
@@ -139,11 +189,27 @@ namespace LibreSpotUWP.Services
 
                 _lastMediaSignature = signature;
                 _lastMediaState = state?.Clone();
+                var mediaRevision = Interlocked.Increment(ref _mediaRevision);
+
+                // Do not queue either current-track rendering or removal of stale
+                // Now Playing content behind Home/recent-item network enrichment.
+                // This lane builds only from the media snapshot and serializes just
+                // the final TileUpdater call.
+                if (_isSignedIn &&
+                    UserSettings.LiveTilesEnabled)
+                {
+                    var showNowPlaying = UserSettings.LiveTileNowPlayingEnabled &&
+                        ShouldShowNowPlaying(_lastMediaState);
+                    _ = RefreshMediaTileImmediatelyAsync(
+                        _lastMediaState?.Clone(),
+                        mediaRevision,
+                        showNowPlaying);
+                }
 
                 QueueRefresh(
                     forceRecentRefresh: _isSignedIn && !ShouldShowNowPlaying(_lastMediaState),
                     reason: "media",
-                    delay: TimeSpan.FromSeconds(1));
+                    delay: TimeSpan.Zero);
             }
             catch (Exception ex)
             {
@@ -151,7 +217,7 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        private async void OnAuthStateChanged(object sender, AuthState state)
+        private void OnAuthStateChanged(object sender, AuthState state)
         {
             try
             {
@@ -164,8 +230,7 @@ namespace LibreSpotUWP.Services
 
                 if (!_isSignedIn)
                 {
-                    CancelQueuedRefresh();
-                    await RefreshTileAsync(forceRecentRefresh: false, reason: "auth").ConfigureAwait(false);
+                    QueueRefresh(forceRecentRefresh: false, reason: "auth", delay: TimeSpan.Zero);
                 }
                 else
                 {
@@ -181,13 +246,12 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        private async void OnUserChanged(object sender, AppUserProfile user)
+        private void OnUserChanged(object sender, AppUserProfile user)
         {
             try
             {
                 _currentUser = user;
                 QueueRefresh(forceRecentRefresh: false, reason: "user", delay: TimeSpan.FromSeconds(1));
-                await Task.CompletedTask;
             }
             catch (Exception ex)
             {
@@ -197,119 +261,184 @@ namespace LibreSpotUWP.Services
 
         private void QueueRefresh(bool forceRecentRefresh, string reason, TimeSpan delay)
         {
-            CancellationTokenSource previous;
-            CancellationTokenSource current;
-            bool queuedForce;
-            string queuedReason;
-
+            var startWorker = _refreshRequests.Enqueue(
+                forceRecentRefresh,
+                reason,
+                DateTimeOffset.UtcNow.Add(delay));
             lock (_refreshScheduleLock)
             {
-                previous = _refreshDebounceCts;
-                previous?.Cancel();
+                if (!startWorker)
+                {
+                    Interlocked.Increment(ref _coalescedRequestCount);
+                    try
+                    {
+                        _refreshWakeSignal.Release();
+                    }
+                    catch (SemaphoreFullException)
+                    {
+                        // A wake-up is already queued for the active worker.
+                    }
+                    return;
+                }
 
-                _queuedForceRecentRefresh = _queuedForceRecentRefresh || forceRecentRefresh;
-                _queuedRefreshReason = string.IsNullOrWhiteSpace(_queuedRefreshReason)
-                    ? reason
-                    : _queuedRefreshReason + "+" + reason;
-
-                queuedForce = _queuedForceRecentRefresh;
-                queuedReason = _queuedRefreshReason;
-                current = new CancellationTokenSource();
-                _refreshDebounceCts = current;
+                _refreshWorkerTask = Task.Run(ProcessRefreshQueueAsync);
             }
+        }
 
-            var token = current.Token;
-            var ignored = Task.Run(async () =>
+        private async Task ProcessRefreshQueueAsync()
+        {
+            while (true)
             {
                 try
                 {
-                    await Task.Delay(delay, token).ConfigureAwait(false);
-
-                    lock (_refreshScheduleLock)
+                    if (!_refreshRequests.TryTake(
+                        DateTimeOffset.UtcNow,
+                        out CoalescedRefreshRequest request,
+                        out TimeSpan remainingDelay))
                     {
-                        if (!ReferenceEquals(_refreshDebounceCts, current))
-                            return;
+                        if (remainingDelay > TimeSpan.Zero)
+                        {
+                            await _refreshWakeSignal.WaitAsync(remainingDelay).ConfigureAwait(false);
+                            continue;
+                        }
 
-                        _refreshDebounceCts = null;
-                        _queuedForceRecentRefresh = false;
-                        _queuedRefreshReason = null;
+                        _refreshRequests.CompleteOrContinue();
+                        return;
                     }
 
-                    await RefreshTileAsync(queuedForce, queuedReason).ConfigureAwait(false);
-                }
-                catch (TaskCanceledException)
-                {
-                }
-                catch (ObjectDisposedException)
-                {
+                    await RefreshTileAsync(request.Force, request.Reasons).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    LogService.Warn($"[LiveTileService.QueueRefresh] Unable to refresh queued tile for {reason}: {ex.Message}");
+                    LogService.Telemetry(
+                        "live-tile-refresh-failure",
+                        $"Unable to process coalesced live-tile refresh: {ex.Message}",
+                        warning: true);
                 }
-                finally
-                {
-                    current.Dispose();
-                }
-            });
-        }
 
-        private void CancelQueuedRefresh()
-        {
-            lock (_refreshScheduleLock)
-            {
-                _refreshDebounceCts?.Cancel();
-                _refreshDebounceCts?.Dispose();
-                _refreshDebounceCts = null;
-                _queuedForceRecentRefresh = false;
-                _queuedRefreshReason = null;
+                if (!_refreshRequests.CompleteOrContinue())
+                    return;
             }
         }
 
         private async Task RefreshTileAsync(bool forceRecentRefresh, string reason)
         {
-            var version = Interlocked.Increment(ref _updateVersion);
-            await _updateGate.WaitAsync().ConfigureAwait(false);
+            using (UiResponsivenessTelemetry.BeginOperation("LiveTile.Refresh"))
+            {
+                try
+                {
+                    var mediaRevision = Interlocked.Read(ref _mediaRevision);
+                    if (!UserSettings.LiveTilesEnabled || !_isSignedIn)
+                    {
+                        await ApplyLoggedOutTileAsync(mediaRevision).ConfigureAwait(false);
+                        return;
+                    }
 
+                    var state = (_lastMediaState ?? _media.Current)?.Clone();
+                    var nowPlaying = ShouldShowNowPlaying(state);
+
+                    CacheRecentSongFromState(state);
+                    if (!nowPlaying)
+                        await EnsureTileDataAsync(forceRecentRefresh).ConfigureAwait(false);
+
+                    var notifications = await Task.Run(() =>
+                        BuildNotifications(state, nowPlaying)
+                            .Where(notification => notification != null)
+                            .Take(MaxTileNotifications)
+                            .ToList()).ConfigureAwait(false);
+
+                    if (notifications.Count == 0)
+                    {
+                        await ApplyLoggedOutTileAsync(mediaRevision).ConfigureAwait(false);
+                        return;
+                    }
+
+                    await ApplyNotificationsIfCurrentAsync(
+                        notifications,
+                        state,
+                        nowPlaying,
+                        reason,
+                        mediaRevision).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    LogService.Telemetry(
+                        "live-tile-refresh-failure",
+                        $"Unable to refresh live tile for merged reasons={reason}: {ex.Message}",
+                        warning: true);
+                }
+            }
+        }
+
+        private async Task RefreshMediaTileImmediatelyAsync(
+            MediaState state,
+            long mediaRevision,
+            bool nowPlaying)
+        {
             try
             {
-                if (version != _updateVersion)
-                    return;
-
-                if (!UserSettings.LiveTilesEnabled || !_isSignedIn)
-                {
-                    ApplyLoggedOutTile();
-                    return;
-                }
-
-                var state = _lastMediaState ?? _media.Current;
-                var nowPlaying = ShouldShowNowPlaying(state);
-
-                CacheRecentSongFromState(state);
-                if (!nowPlaying)
-                    await EnsureTileDataAsync(forceRecentRefresh).ConfigureAwait(false);
-
-                var notifications = BuildNotifications(state, nowPlaying)
-                    .Where(notification => notification != null)
-                    .Take(MaxTileNotifications)
-                    .ToList();
-
-                if (notifications.Count == 0)
-                {
-                    ApplyLoggedOutTile();
-                    return;
-                }
-
-                ApplyNotifications(notifications);
-                LogService.Info($"[LiveTileService.RefreshTileAsync] Refreshed tile for {reason}.");
+                var notification = await Task.Run(() => nowPlaying
+                        ? CreateNowPlayingNotification(state)
+                        : CreateImmediateIdleNotification(state))
+                    .ConfigureAwait(false);
+                await ApplyNotificationsIfCurrentAsync(
+                    new[] { notification },
+                    state,
+                    nowPlaying,
+                    reason: "media-immediate",
+                    expectedMediaRevision: mediaRevision).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                LogService.Warn($"[LiveTileService.RefreshTileAsync] Unable to refresh tile for {reason}: {ex.Message}");
+                LogService.Telemetry(
+                    "live-tile-immediate-failure",
+                    $"Unable to apply the immediate media-state tile: {ex.Message}",
+                    warning: true);
+            }
+        }
+
+        private async Task<bool> ApplyNotificationsIfCurrentAsync(
+            IReadOnlyList<TileNotification> notifications,
+            MediaState state,
+            bool nowPlaying,
+            string reason,
+            long expectedMediaRevision)
+        {
+            await _tileUpdateGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (expectedMediaRevision != Interlocked.Read(ref _mediaRevision) ||
+                    !UserSettings.LiveTilesEnabled ||
+                    !_isSignedIn)
+                {
+                    LogService.Telemetry(
+                        "live-tile-stale",
+                        $"Skipped stale live-tile content for reasons={reason}.");
+                    return false;
+                }
+
+                var signature = BuildNotificationSignature(notifications);
+                if (string.Equals(signature, _lastOsContentSignature, StringComparison.Ordinal))
+                {
+                    Interlocked.Increment(ref _unchangedSkipCount);
+                    LogService.Telemetry(
+                        "live-tile-unchanged",
+                        $"Skipped unchanged live-tile content for reasons={reason}.");
+                    return false;
+                }
+
+                await Task.Run(() => ApplyNotifications(notifications, state, nowPlaying))
+                    .ConfigureAwait(false);
+                _lastOsContentSignature = signature;
+                Interlocked.Increment(ref _osUpdateCount);
+                LogService.Telemetry(
+                    "live-tile-updated",
+                    $"Refreshed live tile for reasons={reason}; osUpdateCount={OsUpdateCount}, coalescedRequests={CoalescedRequestCount}, unchangedSkips={UnchangedSkipCount}.");
+                return true;
             }
             finally
             {
-                _updateGate.Release();
+                _tileUpdateGate.Release();
             }
         }
 
@@ -514,17 +643,46 @@ namespace LibreSpotUWP.Services
             SaveItemsToSettings(RecentTileSongsKey, _recentSongs);
         }
 
-        private void ApplyLoggedOutTile()
+        private async Task ApplyLoggedOutTileAsync(long expectedMediaRevision)
         {
-            var updater = TileUpdateManager.CreateTileUpdaterForApplication();
-            updater.EnableNotificationQueue(false);
-            updater.Clear();
-            LogService.Info("[LiveTileService.ApplyLoggedOutTile] Cleared live tile to manifest default.");
+            await _tileUpdateGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (expectedMediaRevision != Interlocked.Read(ref _mediaRevision))
+                    return;
+
+                const string signature = "manifest-default";
+                if (string.Equals(_lastOsContentSignature, signature, StringComparison.Ordinal))
+                {
+                    Interlocked.Increment(ref _unchangedSkipCount);
+                    return;
+                }
+
+                await Task.Run(ApplyLoggedOutTile).ConfigureAwait(false);
+                _lastOsContentSignature = signature;
+                Interlocked.Increment(ref _osUpdateCount);
+            }
+            finally
+            {
+                _tileUpdateGate.Release();
+            }
         }
 
-        private static void ApplyNotifications(IReadOnlyList<TileNotification> notifications)
+        private static void ApplyLoggedOutTile()
         {
             var updater = TileUpdateManager.CreateTileUpdaterForApplication();
+            ClearScheduledTileUpdates(updater);
+            updater.EnableNotificationQueue(false);
+            updater.Clear();
+        }
+
+        private void ApplyNotifications(
+            IReadOnlyList<TileNotification> notifications,
+            MediaState state,
+            bool nowPlaying)
+        {
+            var updater = TileUpdateManager.CreateTileUpdaterForApplication();
+            ClearScheduledTileUpdates(updater);
             updater.EnableNotificationQueue(notifications.Count > 1);
             updater.Clear();
 
@@ -532,6 +690,48 @@ namespace LibreSpotUWP.Services
             {
                 updater.Update(notification);
             }
+
+            if (nowPlaying && notifications.Any(notification => notification?.Tag == "now"))
+                ScheduleRecentSongsFallback(updater, state);
+        }
+
+        private void ScheduleRecentSongsFallback(TileUpdater updater, MediaState state)
+        {
+            var fallback = CreateRecentSongsNotification(state);
+            if (fallback?.Content == null)
+                return;
+
+            var deliveryTime = GetExpectedTrackEnd(state);
+            var scheduled = new ScheduledTileNotification(fallback.Content, deliveryTime)
+            {
+                Id = "idle",
+                ExpirationTime = deliveryTime.Add(ScheduledFallbackLifetime)
+            };
+            updater.AddToSchedule(scheduled);
+        }
+
+        private static void ClearScheduledTileUpdates(TileUpdater updater)
+        {
+            foreach (var scheduled in updater.GetScheduledTileNotifications().ToList())
+                updater.RemoveFromSchedule(scheduled);
+        }
+
+        private static string BuildNotificationSignature(IReadOnlyList<TileNotification> notifications)
+        {
+            if (notifications == null || notifications.Count == 0)
+                return "manifest-default";
+
+            return string.Join("\n", notifications.Select(notification =>
+            {
+                var expirationSecond = notification?.Tag == "now" &&
+                    notification.ExpirationTime.HasValue
+                        ? (notification.ExpirationTime.Value.UtcDateTime.Ticks /
+                           TimeSpan.TicksPerSecond).ToString()
+                        : string.Empty;
+                return (notification?.Tag ?? string.Empty) + ":" +
+                    expirationSecond + ":" +
+                    (notification?.Content?.GetXml() ?? string.Empty);
+            }));
         }
 
         private static TileNotification CreateNowPlayingNotification(MediaState state)
@@ -562,7 +762,7 @@ namespace LibreSpotUWP.Services
         private TileNotification CreateRecentSongsNotification(MediaState state)
         {
             var songs = _recentSongs.Count > 0
-                ? _recentSongs
+                ? _recentSongs.ToList()
                 : new List<LiveTileItemSnapshot>();
 
             if (songs.Count == 0)
@@ -582,6 +782,35 @@ namespace LibreSpotUWP.Services
                 });
             }
 
+            return CreateRecentSongsNotification(songs);
+        }
+
+        private static TileNotification CreateImmediateIdleNotification(MediaState state)
+        {
+            var songs = new List<LiveTileItemSnapshot>();
+            if (UserSettings.LiveTileRecentSongsEnabled)
+            {
+                var lastTrack = FromMediaState(state);
+                if (lastTrack != null)
+                    songs.Add(lastTrack);
+            }
+
+            if (songs.Count == 0)
+            {
+                songs.Add(new LiveTileItemSnapshot
+                {
+                    Kind = LiveTileItemKind.Track,
+                    Title = "Ready to play",
+                    Subtitle = "Open LibreSpotUWP"
+                });
+            }
+
+            return CreateRecentSongsNotification(songs);
+        }
+
+        private static TileNotification CreateRecentSongsNotification(
+            IReadOnlyList<LiveTileItemSnapshot> songs)
+        {
             var imageSource = ResolveTileImageSource(songs[0].ImageUrl, useFallback: true);
             return CreateNotification(
                 BuildTileDocument(
@@ -994,14 +1223,21 @@ namespace LibreSpotUWP.Services
 
         private static DateTimeOffset GetNowPlayingExpiration(MediaState state)
         {
-            var minimum = TimeSpan.FromMinutes(10);
-            var maximum = TimeSpan.FromHours(6);
-            var remaining = minimum;
+            return GetExpectedTrackEnd(state).Add(TimeSpan.FromMinutes(2));
+        }
 
-            if (state != null && state.DurationMs > state.PositionMs)
+        private static DateTimeOffset GetExpectedTrackEnd(MediaState state)
+        {
+            var minimum = TimeSpan.FromSeconds(2);
+            var maximum = TimeSpan.FromHours(6);
+            var remaining = TimeSpan.FromMinutes(15);
+
+            if (state != null && state.DurationMs > 0)
             {
-                remaining = TimeSpan.FromMilliseconds(state.DurationMs - state.PositionMs)
-                    .Add(TimeSpan.FromMinutes(5));
+                var remainingMilliseconds = state.DurationMs > state.PositionMs
+                    ? state.DurationMs - state.PositionMs
+                    : 0;
+                remaining = TimeSpan.FromMilliseconds(remainingMilliseconds);
             }
 
             if (remaining < minimum)
@@ -1009,7 +1245,7 @@ namespace LibreSpotUWP.Services
             if (remaining > maximum)
                 remaining = maximum;
 
-            return DateTimeOffset.UtcNow.Add(remaining);
+            return DateTimeOffset.UtcNow.Add(remaining).Add(TimeSpan.FromSeconds(1));
         }
 
         private static bool ShouldShowNowPlaying(MediaState state)
@@ -1032,9 +1268,9 @@ namespace LibreSpotUWP.Services
                 track?.Name ?? string.Empty,
                 track?.Artist ?? string.Empty,
                 track?.Album ?? string.Empty,
+                state.DurationMs.ToString(),
                 state.ArtworkUri ?? string.Empty,
                 state.ContextName ?? string.Empty,
-                state.IsNarrationActive.ToString(),
                 state.IsSpotifyConnectRemote.ToString(),
                 state.SpotifyConnectDeviceName ?? string.Empty
             });
@@ -1054,9 +1290,9 @@ namespace LibreSpotUWP.Services
                 Kind = LiveTileItemKind.Track,
                 Id = id,
                 Uri = metadata?.Uri ?? track?.Uri,
-                Title = state.DisplayTitle,
-                Subtitle = state.DisplayArtist,
-                Detail = SafeText(state.DisplayAlbumTitle, state.ContextName),
+                Title = SafeText(metadata?.Name, track?.Name),
+                Subtitle = SafeText(GetArtistLine(metadata), track?.Artist),
+                Detail = SafeText(metadata?.Album?.Name, track?.Album, state.ContextName),
                 ImageUrl = SafeText(
                     state.ArtworkUri,
                     metadata?.Album?.Images?.FirstOrDefault()?.Url,

@@ -34,6 +34,7 @@ namespace LibreSpotUWP
         public static string AuthToken { get; set; }
         public static ILibrespotService Librespot { get; private set; }
         public static ISpotifyAuthService SpotifyAuth { get; private set; }
+        public static ISpotifyPlaybackAuthService SpotifyPlaybackAuth { get; private set; }
         public static ISpotifyWebService SpotifyWeb { get; private set; }
         public static IMediaService Media { get; private set; }
         public static IOfflineCatalogService OfflineCatalog { get; private set; }
@@ -58,6 +59,7 @@ namespace LibreSpotUWP
         {
             InitializeComponent();
             Suspending += OnSuspending;
+            Resuming += OnResuming;
             UnhandledException += App_UnhandledException;
             TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
         }
@@ -129,9 +131,11 @@ namespace LibreSpotUWP
                     {
                         LogService.Info("PKCE Code received.");
                         await SpotifyAuth.ExchangePkceCodeAsync(code);
+                        await PlaybackAuthorizationDialog.ShowIfNeededAsync(force: true);
                     }
 
                     Window.Current.Activate();
+                    UiResponsivenessTelemetry.Start();
                 }
             }
             catch (SpotifyPremiumRequiredException ex)
@@ -205,9 +209,8 @@ namespace LibreSpotUWP
                 if (e.PrelaunchActivated == false)
                 {
                     Window.Current.Activate();
-
-                    if (shouldCheckForUpdates)
-                        _ = CheckForUpdatesAtStartup();
+                    UiResponsivenessTelemetry.SetCurrentPage(isSignedIn ? "Home" : "Oobe");
+                    UiResponsivenessTelemetry.Start();
 
                     if (_startupPremiumRequiredException != null)
                     {
@@ -215,6 +218,15 @@ namespace LibreSpotUWP
                         _startupPremiumRequiredException = null;
                         await PremiumRequiredDialog.ShowAsync(premiumRequired);
                     }
+
+                    if (isSignedIn)
+                        await PlaybackAuthorizationDialog.ShowIfNeededAsync();
+
+                    if (isSignedIn)
+                        await AudioKeyCompatibilityWarning.ShowIfNeededAsync();
+
+                    if (shouldCheckForUpdates)
+                        _ = CheckForUpdatesAtStartup();
 
                     if (shouldNavigateToLaunchTarget)
                         await NavigateToLiveTileTargetAsync(launchNavigationTag);
@@ -254,12 +266,15 @@ namespace LibreSpotUWP
             _secureStorage = new SecureStorage();
             KeyCache = new AudioKeyCache();
             await KeyCache.InitializeAsync();
-            Librespot = new LibrespotService(KeyCache, _secureStorage);
+            Librespot = new LibrespotService(KeyCache);
             SpotifyAuth = new SpotifyAuthService(_secureStorage);
+            SpotifyPlaybackAuth = new SpotifyPlaybackAuthService(_secureStorage);
+            await SpotifyPlaybackAuth.InitializeAsync();
+            SpotifyAuth.AuthStateChanged += OnSpotifyWebAuthStateChanged;
             SpotifyWeb = new SpotifyWebService(SpotifyAuth, _metadataCache, Librespot);
             OfflineCatalog = new OfflineCatalogService();
             Downloads = new DownloadTrackerService();
-            Media = new MediaService(Librespot, SpotifyAuth, SpotifyWeb);
+            Media = new MediaService(Librespot, SpotifyAuth, SpotifyPlaybackAuth, SpotifyWeb);
             BackgroundExecution = new UwpBackgroundExecutionManager();
 
             await Librespot.InitializeAsync();
@@ -289,7 +304,35 @@ namespace LibreSpotUWP
 
             if (!string.IsNullOrEmpty(token))
             {
-                await Librespot.ConnectWithAccessTokenAsync(token);
+                try
+                {
+                    var playbackAuthorization = await SpotifyPlaybackAuth.GetConnectionMaterialAsync();
+                    if (playbackAuthorization != null && !playbackAuthorization.IsEmpty)
+                        await Librespot.ConnectWithPlaybackAuthAsync(playbackAuthorization);
+                    else
+                        LogService.Warn("[App.EnsureServicesInitializedAsync] Spotify Web API session is valid, but playback authorization is required.");
+                }
+                catch (Exception ex)
+                {
+                    LogService.Error(ex, "[App.EnsureServicesInitializedAsync] Playback authorization failed during startup; quarantining it and continuing without playback");
+                    try
+                    {
+                        await SpotifyPlaybackAuth.MarkRejectedAsync();
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        LogService.Warn($"[App.EnsureServicesInitializedAsync] Unable to quarantine startup playback authorization: {cleanupError.Message}");
+                    }
+
+                    try
+                    {
+                        await Librespot.DisconnectAsync();
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        LogService.Warn($"[App.EnsureServicesInitializedAsync] Unable to stop failed startup playback session: {cleanupError.Message}");
+                    }
+                }
 
                 if (hasInternet)
                     await OfflineCatalog.RemoveExpiredPersistedTracksAsync();
@@ -314,6 +357,24 @@ namespace LibreSpotUWP
 
             _servicesInitialized = true;
             return isSignedIn;
+        }
+
+        private async void OnSpotifyWebAuthStateChanged(object sender, Models.AuthState state)
+        {
+            if (state != null)
+                return;
+
+            try
+            {
+                if (Librespot != null)
+                    await Librespot.DisconnectAsync();
+                if (SpotifyPlaybackAuth != null)
+                    await SpotifyPlaybackAuth.ResetAsync();
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[App.OnSpotifyWebAuthStateChanged] Unable to clear playback authorization after sign-out: {ex.Message}");
+            }
         }
 
         private static bool IsCurrentUserSignedIn()
@@ -444,9 +505,12 @@ namespace LibreSpotUWP
         /// <param name="e">Details about the suspend request.</param>
         private async void OnSuspending(object sender, SuspendingEventArgs e)
         {
+            UiResponsivenessTelemetry.Stop();
             var deferral = e.SuspendingOperation.GetDeferral();
             try
             {
+                if (Media != null)
+                    await Media.PrepareForSuspendingAsync();
                 if (LiveTiles != null)
                     await LiveTiles.PrepareForSuspendingAsync();
             }
@@ -457,6 +521,21 @@ namespace LibreSpotUWP
             finally
             {
                 deferral.Complete();
+            }
+        }
+
+        private async void OnResuming(object sender, object e)
+        {
+            try
+            {
+                UiResponsivenessTelemetry.Start();
+                if (Media != null)
+                    await Media.ResumeAfterSuspendingAsync();
+                LiveTiles?.RefreshAfterResuming();
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"Unable to resume media services: {ex.Message}");
             }
         }
 

@@ -1,5 +1,4 @@
 using LibreSpotUWP.Exceptions;
-using LibreSpotUWP.Helpers;
 using LibreSpotUWP.Interfaces;
 using LibreSpotUWP.Models;
 using LibreSpotUWP.ViewModels;
@@ -7,6 +6,7 @@ using LibreSpotUWP.Services;
 using SpotifyAPI.Web;
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.UI.Xaml;
@@ -27,7 +27,11 @@ namespace LibreSpotUWP.Views.Win10_1507
             InitializeComponent();
             DataContext = this;
             Loaded += HomePage_Loaded;
-            Unloaded += (s, e) => _cts?.Cancel();
+            Unloaded += (s, e) =>
+            {
+                _cts?.Cancel();
+                ViewModel.CancelCurrentLoad();
+            };
         }
 
         private async void HomePage_Loaded(object sender, RoutedEventArgs e)
@@ -61,12 +65,12 @@ namespace LibreSpotUWP.Views.Win10_1507
                 _cts?.Cancel();
                 _cts = new CancellationTokenSource();
 
-                if (Helpers.ConnectivityHelper.HasInternetAccess())
-                    await ViewModel.LoadAsync(_spotify, _cts.Token);
-                else
-                    await ViewModel.LoadOfflineAsync(App.OfflineCatalog);
+                var applied = Helpers.ConnectivityHelper.HasInternetAccess()
+                    ? await ViewModel.LoadAsync(_spotify, _cts.Token)
+                    : await ViewModel.LoadOfflineAsync(App.OfflineCatalog, _cts.Token);
 
-                UpdateStatusBanner();
+                if (applied)
+                    UpdateStatusBanner();
             }
             catch (OperationCanceledException) { }
             catch (SpotifyWebException ex)
@@ -75,7 +79,7 @@ namespace LibreSpotUWP.Views.Win10_1507
             }
         }
 
-        private void HomeItem_Click(object sender, ItemClickEventArgs e)
+        private async void HomeItem_Click(object sender, ItemClickEventArgs e)
         {
             var item = e.ClickedItem;
 
@@ -102,13 +106,8 @@ namespace LibreSpotUWP.Views.Win10_1507
                     break;
 
                 case FullPlaylist playlist:
-                    if (SpotifyDjHelper.IsHomeDjPlaylist(playlist))
-                    {
-                        mainPage.NavigateTo("Player");
-                        _ = PlayDjPlaylistAsync(playlist);
+                    if (await Helpers.SpotifyDjSupportHelper.ShowIfUnsupportedAsync(playlist))
                         break;
-                    }
-
                     mainPage.NavigateToPlaylist(playlist.Id);
                     LogService.Info($"Navigating to playlist: {playlist.Name}");
                     break;
@@ -127,25 +126,23 @@ namespace LibreSpotUWP.Views.Win10_1507
                     break;
 
                 case OfflineTrackEntry offlineTrack:
-                    _ = App.Media.PlayAsync(offlineTrack.TrackUri, null);
+                    var offlineGroup = ViewModel.GroupedHomeContent
+                        .FirstOrDefault(group => group.Items.Contains(offlineTrack));
+                    var offlineQueue = offlineGroup?.Items
+                        .OfType<OfflineTrackEntry>()
+                        .Select(track => track.TrackUri)
+                        .Where(uri => !string.IsNullOrWhiteSpace(uri))
+                        .ToList();
+                    _ = App.Media.PlayAsync(
+                        offlineTrack.TrackUri,
+                        null,
+                        offlineQueue,
+                        offlineQueue?.IndexOf(offlineTrack.TrackUri) ?? -1);
                     break;
 
                 default:
                     LogService.Info("Unknown item type clicked: " + item.GetType().Name);
                     break;
-            }
-        }
-
-        private async Task PlayDjPlaylistAsync(FullPlaylist playlist)
-        {
-            try
-            {
-                await App.Media.PlayAsync(SpotifyDjHelper.GetPlaylistUri(playlist), null);
-                LogService.Info("Started Spotify DJ from the Home shortcut.");
-            }
-            catch (Exception ex)
-            {
-                LogService.Error(ex, "Unable to start Spotify DJ from the Home shortcut.");
             }
         }
 
@@ -181,12 +178,12 @@ namespace LibreSpotUWP.Views.Win10_1507
                 _cts?.Cancel();
                 _cts = new CancellationTokenSource();
 
-                if (Helpers.ConnectivityHelper.HasInternetAccess())
-                    await ViewModel.LoadAsync(_spotify, _cts.Token, true);
-                else
-                    await ViewModel.LoadOfflineAsync(App.OfflineCatalog);
+                var applied = Helpers.ConnectivityHelper.HasInternetAccess()
+                    ? await ViewModel.LoadAsync(_spotify, _cts.Token, true)
+                    : await ViewModel.LoadOfflineAsync(App.OfflineCatalog, _cts.Token);
 
-                UpdateStatusBanner();
+                if (applied)
+                    UpdateStatusBanner();
             }
             catch (OperationCanceledException)
             {

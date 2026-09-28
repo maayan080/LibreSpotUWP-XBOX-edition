@@ -23,6 +23,7 @@ namespace LibreSpotUWP.Controls
 
         private bool _showAlbum;
         private bool _isLoadingMore = false;
+        private int _queueTrackCount;
         private readonly Dictionary<string, TrackRowVisuals> _rowVisuals = new Dictionary<string, TrackRowVisuals>(StringComparer.OrdinalIgnoreCase);
         private string _currentTrackUri;
         public Func<FullTrack, bool> IsTrackPersistedResolver { get; set; }
@@ -89,6 +90,7 @@ namespace LibreSpotUWP.Controls
             {
                 TrackListView.Items.Clear();
                 _rowVisuals.Clear();
+                _queueTrackCount = 0;
                 _showAlbum = trackList.Any(t => t.Album != null);
                 AddHeader();
             }
@@ -98,6 +100,7 @@ namespace LibreSpotUWP.Controls
                 var item = new TrackListItem
                 {
                     TrackNumber = ++startingIndex,
+                    QueueIndex = _queueTrackCount++,
                     Name = t?.Name ?? "",
                     ArtistName = t?.Artists != null ? string.Join(", ", t.Artists.Select(a => a.Name)) : "",
                     ArtistObjects = t?.Artists?.ToList() ?? new List<SimpleArtist>(),
@@ -305,7 +308,7 @@ namespace LibreSpotUWP.Controls
                 if (item.RawTrack is FullTrack tappedTrack && !IsTrackAvailable(tappedTrack.Uri))
                     return;
 
-                TrackClicked?.Invoke(this, new TrackClickedEventArgs(item.RawTrack));
+                TrackClicked?.Invoke(this, new TrackClickedEventArgs(item.RawTrack, item.QueueIndex));
             };
 
             return rootGrid;
@@ -325,11 +328,9 @@ namespace LibreSpotUWP.Controls
                 });
         }
 
-        private async void OnMediaStateChanged(object sender, MediaState state)
+        private void OnMediaStateChanged(object sender, MediaState state)
         {
-            await Dispatcher.RunAsync(
-                Windows.UI.Core.CoreDispatcherPriority.Normal,
-                () =>
+            LibreSpotUWP.Services.UiWorkScheduler.RunLatest(this, Dispatcher, () =>
                 {
                     var previousTrackUri = _currentTrackUri;
                     _currentTrackUri = state?.Track?.Uri;
@@ -430,6 +431,7 @@ namespace LibreSpotUWP.Controls
     public class TrackListItem
     {
         public int TrackNumber { get; set; }
+        public int QueueIndex { get; set; }
         public string Name { get; set; }
         public string ArtistName { get; set; }
         public List<SimpleArtist> ArtistObjects { get; set; }
@@ -443,7 +445,12 @@ namespace LibreSpotUWP.Controls
     public class TrackClickedEventArgs : EventArgs
     {
         public object Track { get; }
-        public TrackClickedEventArgs(object track) => Track = track;
+        public int Index { get; }
+        public TrackClickedEventArgs(object track, int index = -1)
+        {
+            Track = track;
+            Index = index;
+        }
     }
 
     internal sealed class TrackRowVisuals

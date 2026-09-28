@@ -49,6 +49,7 @@ namespace LibreSpotUWP.Interop
             public IntPtr password;
             public IntPtr auth_blob;
             public IntPtr access_token;
+            public IntPtr playback_credentials;
 
             public LibrespotKeyCallback key_callback;
             public LibrespotKeySaveCallback key_save_callback;
@@ -99,7 +100,9 @@ namespace LibreSpotUWP.Interop
             Preloading = 22,
             TimeToPreloadNextTrack = 23,
             PositionChanged = 24,
-            NarrationChanged = 25,
+            PlaybackKeyUnavailable = 25,
+            PlaybackAuthorizationRejected = 26,
+            PlaybackAccountUnsupported = 27,
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -141,8 +144,10 @@ namespace LibreSpotUWP.Interop
             public IntPtr session_user;
             public IntPtr client_name;
             public IntPtr log_msg;
+            public ulong audio_generation;
+
             [MarshalAs(UnmanagedType.U1)]
-            public bool is_narrating;
+            public bool was_preloaded;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -325,6 +330,9 @@ namespace LibreSpotUWP.Interop
         public static extern void librespot_load(IntPtr inst, IntPtr contextUri, IntPtr startUri, bool play);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void librespot_load_tracks(IntPtr inst, IntPtr contextUri, IntPtr tracksJson, IntPtr startUri, bool play);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void librespot_play(IntPtr inst);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -373,6 +381,35 @@ namespace LibreSpotUWP.Interop
         public static extern void librespot_audio_set_read_cursor(UIntPtr pos);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void librespot_audio_set_read_sequence(ulong sequence);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void librespot_audio_get_state(
+            out ulong generation,
+            out ulong generationStartSequence,
+            out ulong writeSequence);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.U1)]
+        public static extern bool librespot_audio_set_backend(uint backend, IntPtr deviceId);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint librespot_audio_get_backend();
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr librespot_audio_get_last_error();
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void librespot_audio_set_effects(
+            uint preset,
+            float strength,
+            [MarshalAs(UnmanagedType.U1)] bool echo,
+            [MarshalAs(UnmanagedType.U1)] bool reverb,
+            [MarshalAs(UnmanagedType.U1)] bool limiter,
+            IntPtr gainsDb,
+            UIntPtr gainCount);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         [return: MarshalAs(UnmanagedType.U1)]
         public static extern bool librespot_cache_set_persisted(
             IntPtr inst,
@@ -400,6 +437,9 @@ namespace LibreSpotUWP.Interop
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void librespot_string_free(IntPtr value);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr librespot_get_playback_credentials(IntPtr inst);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr librespot_track_get(IntPtr inst, IntPtr argument);

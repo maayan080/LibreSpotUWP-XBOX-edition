@@ -128,7 +128,132 @@ namespace LibreSpotUWP.Views
             var trackUri = (e.Track as FullTrack)?.Uri ?? (e.Track as SimpleTrack)?.Uri;
             if (trackUri == null) return;
 
-            await App.Media.PlayAsync($"spotify:playlist:{ViewModel.Playlist.Id}", trackUri);
+            var queue = ViewModel.Tracks?.Items?
+                .Select(item => (item?.Track as FullTrack)?.Uri)
+                .Where(uri => !string.IsNullOrWhiteSpace(uri))
+                .ToList();
+            await App.Media.PlayAsync($"spotify:playlist:{ViewModel.Playlist.Id}", trackUri, queue, e.Index);
+        }
+
+        private async void OnTrackPersistRequested(object sender, TrackClickedEventArgs e)
+        {
+            if (!(e.Track is FullTrack track))
+                return;
+
+            var persisted = App.OfflineCatalog.IsTrackPersisted(track.Uri);
+            await App.OfflineCatalog.SetTrackPersistedAsync(track, !persisted);
+            TrackList.IsTrackPersistedResolver = fullTrack => App.OfflineCatalog.IsTrackPersisted(fullTrack?.Uri);
+            TrackList.AddTracks(ViewModel.Tracks.Items.Select(t => t.Track as FullTrack).Where(t => t != null), true, 0);
+        }
+
+        private async Task UpdatePlaylistFollowedStateAsync()
+        {
+            if (ViewModel.Playlist == null || !Helpers.ConnectivityHelper.HasInternetAccess())
+            {
+                PlayActions.SetAdded(false, "Remove playlist from library", "Add playlist to library");
+                return;
+            }
+
+            try
+            {
+                var followed = await App.SpotifyWeb.CheckPlaylistFollowedAsync(ViewModel.Playlist.Id);
+                PlayActions.SetAdded(followed, "Remove playlist from library", "Add playlist to library");
+            }
+            catch
+            {
+                PlayActions.SetAdded(false, "Remove playlist from library", "Add playlist to library");
+            }
+        }
+
+        private async Task TogglePlaylistFollowedAsync()
+        {
+            if (ViewModel.Playlist == null || !Helpers.ConnectivityHelper.HasInternetAccess())
+                return;
+
+            try
+            {
+                var followed = await App.SpotifyWeb.CheckPlaylistFollowedAsync(ViewModel.Playlist.Id);
+                await App.SpotifyWeb.SetPlaylistFollowedAsync(ViewModel.Playlist.Id, !followed);
+                PlayActions.SetAdded(!followed, "Remove playlist from library", "Add playlist to library");
+            }
+            catch
+            {
+                await UpdatePlaylistFollowedStateAsync();
+            }
+        }
+
+        private async Task TogglePlaylistPersistenceAsync()
+        {
+            if (ViewModel.Playlist == null || ViewModel.Tracks?.Items == null)
+                return;
+
+            await EnsureAllPlaylistTracksLoadedAsync();
+
+            var tracks = ViewModel.Tracks.Items.Select(t => t.Track as FullTrack).Where(t => t != null).ToList();
+            var persisted = App.OfflineCatalog.IsPlaylistPersisted(ViewModel.Playlist.Id);
+            await App.OfflineCatalog.SetPlaylistPersistedAsync(ViewModel.Playlist, tracks, !persisted);
+            PlayActions.SetDownloaded(App.OfflineCatalog.IsPlaylistPersisted(ViewModel.Playlist.Id));
+            TrackList.IsTrackPersistedResolver = track => App.OfflineCatalog.IsTrackPersisted(track?.Uri);
+            TrackList.AddTracks(tracks, true, 0);
+        }
+
+        private async void RefreshButton_Click(object sender, RoutedEventArgs e)
+        {
+            await RefreshPlaylistAsync();
+        }
+
+        private async Task RefreshPlaylistAsync()
+        {
+            if (ViewModel.Playlist == null)
+                return;
+
+            SetIsLoading(true, "Refreshing playlist...");
+            try
+            {
+                await ViewModel.LoadAsync(ViewModel.Playlist.Id, true);
+                HeaderControl.SetPlaylist(ViewModel.Playlist);
+                UpdateStatusBanner();
+                PlayActions.SetDownloaded(App.OfflineCatalog.IsPlaylistPersisted(ViewModel.Playlist?.Id));
+                await UpdatePlaylistFollowedStateAsync();
+                TrackList.AddTracks(
+                    ViewModel.Tracks?.Items?.Select(t => t.Track as FullTrack).Where(t => t != null)
+                        ?? Enumerable.Empty<FullTrack>(),
+                    true,
+                    0);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                SetIsLoading(false);
+            }
+        }
+
+        private MainPage GetMainPage()
+        {
+            return (Window.Current.Content as Frame)?.Content as MainPage;
+        }
+
+        private async Task EnsureAllPlaylistTracksLoadedAsync()
+        {
+            while (ViewModel.HasMoreTracks)
+            {
+                await ViewModel.LoadMoreTracksAsync();
+            }
+        }
+
+        private static string BuildCacheTooltip(DateTimeOffset? cachedAt)
+        {
+            return cachedAt.HasValue
+                ? $"Cached on {cachedAt.Value.LocalDateTime:dd MMM yyyy} at {cachedAt.Value.LocalDateTime:HH:mm:ss}"
+                : "Cached data is being shown. Last refresh: Unknown.";
+        }
+
+        private void SetIsLoading(bool isLoading, string message = null)
+        {
+            LoadingOverlay.Visibility = isLoading ? Visibility.Visible : Visibility.Collapsed;
+            LoadingText.Text = message ?? "Loading playlist...";
         }
 
         private async void OnTrackPersistRequested(object sender, TrackClickedEventArgs e)
