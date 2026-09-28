@@ -74,6 +74,7 @@ namespace LibreSpotUWP.Services
 
         public event EventHandler<LibrespotSessionState> SessionStateChanged;
         public event EventHandler<LibrespotTrackInfo> TrackChanged;
+        public event EventHandler<LibrespotNarrationState> NarrationChanged;
         public event EventHandler<LibrespotPlaybackState> PlaybackStateChanged;
         public event EventHandler<LibrespotPlaybackEvent> PlaybackEvent;
         public event EventHandler<LibrespotPositionUpdate> PositionChanged;
@@ -1138,6 +1139,24 @@ namespace LibreSpotUWP.Services
                     };
                     UpdateTrack(track, sessionGeneration);
                     PublishPositionUpdate(0, LibrespotPositionUpdateOrigin.Progress, sessionGeneration);
+                    break;
+
+                case EventType.NarrationChanged:
+                    var narration = new LibrespotNarrationState
+                    {
+                        TrackUri = ReadString(evt.data.track_uri),
+                        PlayRequestId = evt.data.play_request_id,
+                        SessionGeneration = sessionGeneration,
+                        IsActive = evt.data.is_narrating,
+                        DurationMs = evt.data.narration_duration_ms,
+                        Text = ReadString(evt.data.narration_text)
+                    };
+                    LogService.Info(
+                        $"{logPrefix} Narration {(narration.IsActive ? "started" : "ended")}; duration={narration.DurationMs}ms.");
+                    RaiseOnMainThread(
+                        () => NarrationChanged?.Invoke(this, narration),
+                        nameof(NarrationChanged),
+                        sessionGeneration);
                     break;
 
                 case EventType.PlaybackPaused:

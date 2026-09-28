@@ -106,7 +106,7 @@ namespace LibreSpotUWP.Views.Win10_1507
                     break;
 
                 case FullPlaylist playlist:
-                    if (await Helpers.SpotifyDjSupportHelper.ShowIfUnsupportedAsync(playlist))
+                    if (await Helpers.SpotifyDjHelper.StartPlaybackIfDjAsync(playlist, mainPage))
                         break;
                     mainPage.NavigateToPlaylist(playlist.Id);
                     LogService.Info($"Navigating to playlist: {playlist.Name}");

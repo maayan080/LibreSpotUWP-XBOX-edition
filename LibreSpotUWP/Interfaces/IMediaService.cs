@@ -10,6 +10,7 @@ namespace LibreSpotUWP.Interfaces
         Task InitializeAsync();
         Task PlayAsync(string spotifyUri, string contextUri);
         Task PlayAsync(string spotifyUri, string contextUri, IReadOnlyList<string> orderedTrackUris, int startIndex);
+        Task PlaySpotifyDjAsync(string playlistUri, string artworkUri);
         Task PauseAsync();
         Task ResumeAsync();
         Task StopAsync();

@@ -67,6 +67,9 @@ namespace LibreSpotUWP.Services
         }
 
         private MediaState _state = new MediaState();
+        private string _spotifyDjArtworkUri;
+        private uint _narrationPositionMs;
+        private DateTimeOffset _lastNarrationPositionTick;
         private MediaPlayer _mediaPlayer;
         private SystemMediaTransportControls _smtc;
 
@@ -227,6 +230,7 @@ namespace LibreSpotUWP.Services
             _smtc.ButtonPressed += OnSmtcButtonPressed;
 
             _librespot.TrackChanged += OnTrackChanged;
+            _librespot.NarrationChanged += OnNarrationChanged;
             _librespot.PlaybackEvent += OnPlaybackChanged;
             _librespot.PositionChanged += OnPositionChanged;
             _librespot.SessionStateChanged += OnSessionStateChanged;
@@ -276,6 +280,12 @@ namespace LibreSpotUWP.Services
 
         private void PositionTimer_Tick(object sender, object e)
         {
+            if (_state.IsNarrationActive)
+            {
+                PublishNarrationPosition();
+                return;
+            }
+
             if (!IsSelectedSpotifyConnectDeviceLocal)
             {
                 UpdateEstimatedRemotePosition();
@@ -295,6 +305,22 @@ namespace LibreSpotUWP.Services
             }
 
             FlushPositionCorrectionBurstSummary();
+        }
+
+        private void PublishNarrationPosition()
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (_state.PlaybackState == LibrespotPlaybackState.Playing && _lastNarrationPositionTick != default)
+            {
+                var elapsed = Math.Max(0, (long)(now - _lastNarrationPositionTick).TotalMilliseconds);
+                _narrationPositionMs = (uint)Math.Min(
+                    _state.NarrationDurationMs,
+                    (long)_narrationPositionMs + elapsed);
+            }
+            _lastNarrationPositionTick = now;
+
+            UpdateState(state => state.PositionMs = _narrationPositionMs);
+            UpdateSmtcTimeline(_narrationPositionMs);
         }
 
         private void PublishSynchronizedPosition(bool persistSnapshot)
@@ -332,8 +358,10 @@ namespace LibreSpotUWP.Services
             if (_smtc == null)
                 return;
 
-            positionMs = ClampPlaybackPosition(positionMs);
-            var durationMs = Math.Max(_state.DurationMs, positionMs);
+            positionMs = _state.IsNarrationActive
+                ? Math.Min(positionMs, _state.NarrationDurationMs)
+                : ClampPlaybackPosition(positionMs);
+            var durationMs = Math.Max(_state.DisplayDurationMs, positionMs);
 
             var timelineProperties = new SystemMediaTransportControlsTimelineProperties
             {
@@ -655,6 +683,21 @@ namespace LibreSpotUWP.Services
             await _playbackGate.WaitAsync();
             try
             {
+                var continuesDjContext = _state.IsSpotifyDjContext &&
+                    string.Equals(contextUri, _state.ContextUri, StringComparison.OrdinalIgnoreCase);
+                var startsDjContext = SpotifyDjHelper.IsHomeDjPlaylistUri(contextUri) || continuesDjContext;
+                if (!startsDjContext)
+                {
+                    _spotifyDjArtworkUri = null;
+                    UpdateState(state =>
+                    {
+                        state.IsSpotifyDjContext = false;
+                        state.IsNarrationActive = false;
+                        state.NarrationDurationMs = 0;
+                        state.NarrationText = null;
+                    });
+                }
+
                 // Any explicit selection supersedes the startup-only snapshot
                 // resume path, even if the new native load has not reported its
                 // TrackChanged marker yet.
@@ -692,6 +735,26 @@ namespace LibreSpotUWP.Services
             {
                 _playbackGate.Release();
             }
+        }
+
+        public async Task PlaySpotifyDjAsync(string playlistUri, string artworkUri)
+        {
+            if (string.IsNullOrWhiteSpace(playlistUri))
+                throw new ArgumentException("A Spotify DJ playlist URI is required.", nameof(playlistUri));
+
+            _spotifyDjArtworkUri = artworkUri;
+            UpdateState(state =>
+            {
+                state.IsSpotifyDjContext = true;
+                state.IsNarrationActive = false;
+                state.NarrationDurationMs = 0;
+                state.NarrationText = null;
+                state.ArtworkUri = artworkUri;
+                state.ContextUri = playlistUri;
+                state.ContextName = "DJ";
+            });
+            UpdateSmtcDisplay();
+            await PlayAsync(playlistUri, null);
         }
 
         private async Task PlayOnlineQueueRecoveryAsync(string contextUri, string startUri)
@@ -1958,6 +2021,9 @@ namespace LibreSpotUWP.Services
 
         public void Seek(uint posMs)
         {
+            if (Current.IsNarrationActive)
+                return;
+
             CancelProducerRecovery(resetAttemptBudget: true);
             CancelPlaybackContinuationWatchdog();
             _ = SeekSerializedAsync(posMs);
@@ -2563,6 +2629,12 @@ namespace LibreSpotUWP.Services
 
                 UpdateState(state =>
                 {
+                    if (state.Track?.PlayRequestId != track.PlayRequestId)
+                    {
+                        state.IsNarrationActive = false;
+                        state.NarrationDurationMs = 0;
+                        state.NarrationText = null;
+                    }
                     state.Track = track;
                     state.Metadata = null;
                     state.DurationMs = (uint)track.Duration.TotalMilliseconds;
@@ -2571,7 +2643,10 @@ namespace LibreSpotUWP.Services
                     state.IsOffline = !ConnectivityHelper.HasInternetAccess();
                     if (!state.IsOffline)
                         state.StatusMessage = null;
-                    state.ArtworkUri = ResolveArtworkUri(null, track, null);
+                    state.ArtworkUri = state.IsNarrationActive && state.IsSpotifyDjContext &&
+                        !string.IsNullOrWhiteSpace(_spotifyDjArtworkUri)
+                            ? _spotifyDjArtworkUri
+                            : ResolveArtworkUri(null, track, null);
 
                     if (string.IsNullOrWhiteSpace(state.ContextUri))
                         state.ContextUri = track.Uri;
@@ -2652,7 +2727,10 @@ namespace LibreSpotUWP.Services
                     state.IsTrackMetadataFromCache = trackResponse?.IsFromCache == true;
                     state.IsCurrentTrackPersisted = App.OfflineCatalog.IsTrackPersisted(track.Uri);
                     state.StatusMessage = BuildPlaybackStatusMessage(trackResponse) ?? state.StatusMessage;
-                    state.ArtworkUri = ResolveArtworkUri(metadata, track, offlineTrack);
+                    state.ArtworkUri = state.IsNarrationActive && state.IsSpotifyDjContext &&
+                        !string.IsNullOrWhiteSpace(_spotifyDjArtworkUri)
+                            ? _spotifyDjArtworkUri
+                            : ResolveArtworkUri(metadata, track, offlineTrack);
 
                     if (string.IsNullOrWhiteSpace(state.ContextUri))
                         state.ContextUri = track.Uri;
@@ -2668,6 +2746,54 @@ namespace LibreSpotUWP.Services
             {
                 LogService.Error(ex, $"[MediaService.OnTrackChanged] Unhandled error while processing track change for {track?.Uri ?? "(null)"}");
             }
+        }
+
+        private void OnNarrationChanged(object sender, LibrespotNarrationState narration)
+        {
+            if (narration == null ||
+                !IsSelectedSpotifyConnectDeviceLocal ||
+                narration.SessionGeneration != _librespot.SessionGeneration)
+            {
+                return;
+            }
+
+            var currentTrack = Current.Track;
+            if (currentTrack == null ||
+                currentTrack.PlayRequestId != narration.PlayRequestId ||
+                !string.Equals(currentTrack.Uri, narration.TrackUri, StringComparison.OrdinalIgnoreCase))
+            {
+                LogService.Info("[MediaService.OnNarrationChanged] Ignoring narration for a non-current track.");
+                return;
+            }
+
+            UpdateState(state =>
+            {
+                state.IsNarrationActive = narration.IsActive;
+                state.NarrationDurationMs = narration.IsActive ? narration.DurationMs : 0;
+                state.NarrationText = narration.IsActive ? narration.Text : null;
+                if (narration.IsActive)
+                {
+                    _narrationPositionMs = 0;
+                    _lastNarrationPositionTick = DateTimeOffset.UtcNow;
+                    state.PositionMs = 0;
+                }
+                else
+                {
+                    _narrationPositionMs = 0;
+                    _lastNarrationPositionTick = default;
+                    state.PositionMs = 0;
+                }
+                if (state.IsSpotifyDjContext)
+                {
+                    state.ArtworkUri = narration.IsActive && !string.IsNullOrWhiteSpace(_spotifyDjArtworkUri)
+                        ? _spotifyDjArtworkUri
+                        : ResolveArtworkUri(state.Metadata, state.Track, null);
+                }
+            });
+
+            UpdateSmtcDisplay();
+            _positionSynchronizer.Reset(0);
+            UpdateSmtcTimeline(Current.PositionMs);
         }
 
         private async void OnPlaybackChanged(object sender, LibrespotPlaybackEvent playbackEvent)
@@ -4807,11 +4933,15 @@ namespace LibreSpotUWP.Services
             updater.Type = MediaPlaybackType.Music;
 
             var t = _state.Metadata;
-            updater.MusicProperties.Title = t?.Name ?? _state.Track?.Name ?? string.Empty;
-            updater.MusicProperties.Artist = t != null
+            updater.MusicProperties.Title = _state.DisplayTitle;
+            updater.MusicProperties.Artist = _state.IsNarrationActive
+                ? _state.DisplayArtist
+                : t != null
                 ? string.Join(", ", t.Artists?.Select(a => a.Name))
                 : _state.Track?.Artist ?? string.Empty;
-            updater.MusicProperties.AlbumTitle = t?.Album?.Name ?? _state.Track?.Album ?? string.Empty;
+            updater.MusicProperties.AlbumTitle = _state.IsNarrationActive
+                ? "Spotify DJ"
+                : t?.Album?.Name ?? _state.Track?.Album ?? string.Empty;
 
             updater.Thumbnail = null;
             if (TryCreateArtworkUri(_state.ArtworkUri, out var artworkUri))
@@ -5441,6 +5571,7 @@ namespace LibreSpotUWP.Services
             ConnectivityHelper.ConnectivityStatusChanged -= OnConnectivityStatusChanged;
             _playbackAuth.PlaybackAuthStateChanged -= OnPlaybackAuthChanged;
             _librespot.TrackChanged -= OnTrackChanged;
+            _librespot.NarrationChanged -= OnNarrationChanged;
             _librespot.PlaybackEvent -= OnPlaybackChanged;
             _librespot.PositionChanged -= OnPositionChanged;
             _librespot.SessionStateChanged -= OnSessionStateChanged;

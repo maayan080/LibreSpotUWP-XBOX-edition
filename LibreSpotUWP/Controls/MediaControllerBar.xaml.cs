@@ -100,12 +100,13 @@ namespace LibreSpotUWP.Controls
 
             if (!_positionSeekInteraction.IsDragging)
             {
-                PositionSlider.Maximum = state.DurationMs;
+                PositionSlider.Maximum = state.DisplayDurationMs;
                 PositionSlider.Value = state.PositionMs;
                 CurrentTime.Text = Format(state.PositionMs);
             }
 
-            TotalTime.Text = Format(state.DurationMs);
+            PositionSlider.IsEnabled = !state.IsNarrationActive;
+            TotalTime.Text = Format(state.DisplayDurationMs);
 
             PlayPauseIcon.Glyph = state.IsPlaying ? "\uE769" : "\uE768";
             PersistButton.Visibility = Visibility.Visible;
@@ -430,6 +431,12 @@ namespace LibreSpotUWP.Controls
 
         private void UpdateArtistButton(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+            {
+                TrackArtistButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = string.IsNullOrWhiteSpace(GetTrackArtist(state))
                 ? Visibility.Collapsed
@@ -442,6 +449,9 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackTitle(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+                return state.DisplayTitle;
+
             return FirstText(
                 state?.Metadata?.Name,
                 state?.Track?.Name,
@@ -450,6 +460,9 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackArtist(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+                return state.DisplayArtist;
+
             var metadataArtists = state?.Metadata?.Artists?
                 .Select(artist => artist?.Name)
                 .Where(name => !string.IsNullOrWhiteSpace(name));

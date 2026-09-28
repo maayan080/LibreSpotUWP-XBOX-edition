@@ -447,6 +447,13 @@ namespace LibreSpotUWP
                     return;
                 }
 
+                if (tag == "SpotifyDj")
+                {
+                    if (await EnsureAuthenticatedAsync())
+                        await SpotifyDjHelper.StartHomeDjAsync(this);
+                    return;
+                }
+
                 if (tag == "Home")
                 {
                     if (ContentFrame.CurrentSourcePageType != NavigationHelper.GetPageType("Home"))
@@ -656,7 +663,7 @@ namespace LibreSpotUWP
             }
         }
 
-        private void NavItem_Tapped(object sender, TappedRoutedEventArgs e)
+        private async void NavItem_Tapped(object sender, TappedRoutedEventArgs e)
         {
             if (!(sender is ListBoxItem item))
                 return;
@@ -671,6 +678,12 @@ namespace LibreSpotUWP
                 return;
             }
 
+            if (tag == "SpotifyDj")
+            {
+                await PlaySpotifyDjFromNavigationAsync();
+                return;
+            }
+
             if (tag == "Home")
             {
                 if (ContentFrame.CurrentSourcePageType == NavigationHelper.GetPageType("Home"))
@@ -681,6 +694,19 @@ namespace LibreSpotUWP
             }
 
             NavigateTo(tag, true);
+        }
+
+        private async Task PlaySpotifyDjFromNavigationAsync()
+        {
+            try
+            {
+                if (await EnsureAuthenticatedAsync())
+                    await SpotifyDjHelper.StartHomeDjAsync(this);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MainPage.PlaySpotifyDjFromNavigationAsync] Unable to start Spotify DJ: {ex.Message}");
+            }
         }
 
         private void ForceNavigateHome()

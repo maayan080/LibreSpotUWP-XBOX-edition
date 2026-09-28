@@ -140,33 +140,5 @@ namespace LibreSpotUWP.ViewModels
 
             return best;
         }
-
-        private static string BuildStatusMessage<T1, T2>(CacheResponse<T1> first, CacheResponse<T2> second)
-        {
-            var offline = !ConnectivityHelper.HasInternetAccess();
-            if (first?.IsOfflineFallback == true || second?.IsOfflineFallback == true)
-                return "Offline. Playlist details are being shown from cache.";
-
-            if (offline)
-                return "Offline. This playlist is only available here because it was cached earlier.";
-
-            if (first?.IsFromCache == true || second?.IsFromCache == true)
-                return "Showing cached playlist details.";
-
-            return null;
-        }
-
-        private static DateTimeOffset? GetCachedAt<T1, T2>(CacheResponse<T1> first, CacheResponse<T2> second)
-        {
-            DateTimeOffset? best = null;
-
-            if (first?.IsFromCache == true || first?.IsOfflineFallback == true)
-                best = first.Timestamp;
-
-            if (second?.IsFromCache == true || second?.IsOfflineFallback == true)
-                best = !best.HasValue || second.Timestamp > best.Value ? second.Timestamp : best;
-
-            return best;
-        }
     }
 }

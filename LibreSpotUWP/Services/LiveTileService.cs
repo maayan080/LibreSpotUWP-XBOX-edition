@@ -1232,10 +1232,10 @@ namespace LibreSpotUWP.Services
             var maximum = TimeSpan.FromHours(6);
             var remaining = TimeSpan.FromMinutes(15);
 
-            if (state != null && state.DurationMs > 0)
+            if (state != null && state.DisplayDurationMs > 0)
             {
-                var remainingMilliseconds = state.DurationMs > state.PositionMs
-                    ? state.DurationMs - state.PositionMs
+                var remainingMilliseconds = state.DisplayDurationMs > state.PositionMs
+                    ? state.DisplayDurationMs - state.PositionMs
                     : 0;
                 remaining = TimeSpan.FromMilliseconds(remainingMilliseconds);
             }
@@ -1268,9 +1268,12 @@ namespace LibreSpotUWP.Services
                 track?.Name ?? string.Empty,
                 track?.Artist ?? string.Empty,
                 track?.Album ?? string.Empty,
-                state.DurationMs.ToString(),
+                state.DisplayTitle,
+                state.DisplayArtist,
+                state.DisplayDurationMs.ToString(),
                 state.ArtworkUri ?? string.Empty,
                 state.ContextName ?? string.Empty,
+                state.IsNarrationActive.ToString(),
                 state.IsSpotifyConnectRemote.ToString(),
                 state.SpotifyConnectDeviceName ?? string.Empty
             });
@@ -1290,9 +1293,11 @@ namespace LibreSpotUWP.Services
                 Kind = LiveTileItemKind.Track,
                 Id = id,
                 Uri = metadata?.Uri ?? track?.Uri,
-                Title = SafeText(metadata?.Name, track?.Name),
-                Subtitle = SafeText(GetArtistLine(metadata), track?.Artist),
-                Detail = SafeText(metadata?.Album?.Name, track?.Album, state.ContextName),
+                Title = state.DisplayTitle,
+                Subtitle = state.DisplayArtist,
+                Detail = state.IsNarrationActive
+                    ? "Spotify DJ"
+                    : SafeText(metadata?.Album?.Name, track?.Album, state.ContextName),
                 ImageUrl = SafeText(
                     state.ArtworkUri,
                     metadata?.Album?.Images?.FirstOrDefault()?.Url,

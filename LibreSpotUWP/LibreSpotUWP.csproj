@@ -191,7 +191,7 @@
     <Compile Include="Helpers\PlaybackBrowserAuthorizationHelper.cs" />
     <Compile Include="Helpers\QrLoginHelper.cs" />
     <Compile Include="Helpers\SpotifyIdHelper.cs" />
-    <Compile Include="Helpers\SpotifyDjSupportHelper.cs" />
+    <Compile Include="Helpers\SpotifyDjHelper.cs" />
     <Compile Include="Models\CacheResponse.cs" />
     <Compile Include="Models\BulkObservableCollection.cs" />
     <Compile Include="Interfaces\ISpotifyWebService.cs" />
@@ -222,6 +222,7 @@
     <Compile Include="Models\LibrespotPositionUpdate.cs" />
     <Compile Include="Models\LibrespotTrackInfo.cs" />
     <Compile Include="Models\LibrespotSessionState.cs" />
+    <Compile Include="Models\LibrespotNarrationState.cs" />
     <Compile Include="Models\AuthState.cs" />
     <Compile Include="Models\LoginPackage.cs" />
     <Compile Include="Models\PlaybackAuthState.cs" />

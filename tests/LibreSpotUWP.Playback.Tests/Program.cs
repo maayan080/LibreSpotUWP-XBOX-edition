@@ -579,8 +579,8 @@ internal static class Program
                liveTile.Contains("RemoveFromSchedule") &&
                liveTile.Contains("AddToSchedule"),
             "live tile does not schedule and replace its song-boundary fallback");
-        Assert(liveTile.Contains("state.DurationMs.ToString()") &&
-               liveTile.Contains("state.DurationMs > 0") &&
+        Assert(liveTile.Contains("state.DisplayDurationMs.ToString()") &&
+               liveTile.Contains("state.DisplayDurationMs > 0") &&
                liveTile.Contains(": 0;") &&
                liveTile.Contains("notification.ExpirationTime.Value.UtcDateTime.Ticks"),
             "live tile does not reschedule when duration arrives or expire promptly at track end");

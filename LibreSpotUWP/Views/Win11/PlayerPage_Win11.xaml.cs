@@ -110,11 +110,17 @@ namespace LibreSpotUWP.Views.Win11
             {
                 _currentTrackUri = state.Track?.Uri;
 
-                TrackTitle.Text = state.Track?.Name ?? "";
-                TrackArtist.Text = state.Track?.Artist ?? "";
-                TotalTime.Text = Format(state.DurationMs);
-
             }
+
+            TrackTitle.Text = state.DisplayTitle;
+            TrackArtist.Text = state.IsNarrationActive ? "Spotify" : state.DisplayArtist;
+            NarrationTextBlock.Text = state.NarrationText ?? string.Empty;
+            NarrationTextBlock.Visibility = state.IsNarrationActive && !string.IsNullOrWhiteSpace(state.NarrationText)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            ToolTipService.SetToolTip(NarrationTextBlock, state.NarrationText);
+            TotalTime.Text = Format(state.DisplayDurationMs);
+            PositionSlider.IsEnabled = !state.IsNarrationActive;
 
             UpdateArtistButton(state);
             UpdateContextButton(state);
@@ -149,9 +155,9 @@ namespace LibreSpotUWP.Views.Win11
             {
                 _lastUpdateSec = currentSec;
 
-                if (PositionSlider.Maximum != state.DurationMs)
+                if (PositionSlider.Maximum != state.DisplayDurationMs)
                 {
-                    PositionSlider.Maximum = state.DurationMs;
+                    PositionSlider.Maximum = state.DisplayDurationMs;
                 }
 
                 PositionSlider.Value = state.PositionMs;
@@ -550,6 +556,12 @@ namespace LibreSpotUWP.Views.Win11
 
         private void UpdateArtistButton(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+            {
+                TrackArtistButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = artists.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
             TrackArtistButton.IsEnabled = artists.Count > 0;

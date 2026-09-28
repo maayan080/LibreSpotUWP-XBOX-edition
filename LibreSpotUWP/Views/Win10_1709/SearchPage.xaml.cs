@@ -46,7 +46,7 @@ namespace LibreSpotUWP.Views.Win10_1709
 
             else if (item is FullPlaylist playlist)
             {
-                if (!await SpotifyDjSupportHelper.ShowIfUnsupportedAsync(playlist))
+                if (!await SpotifyDjHelper.StartPlaybackIfDjAsync(playlist, GetMainPage()))
                     GetMainPage()?.NavigateToPlaylist(playlist.Id);
             }
 

@@ -224,6 +224,15 @@
                         TextAlignment="Center"
                         TextTrimming="CharacterEllipsis" />
                 </Button>
+                <TextBlock
+                    x:Name="NarrationTextBlock"
+                    MaxWidth="620"
+                    MaxLines="3"
+                    Margin="0,6,0,0"
+                    FontSize="15"
+                    TextAlignment="Center"
+                    TextWrapping="Wrap"
+                    Visibility="Collapsed" />
             </StackPanel>
 
             <Grid

@@ -103,6 +103,7 @@ namespace LibreSpotUWP.Interop
             PlaybackKeyUnavailable = 25,
             PlaybackAuthorizationRejected = 26,
             PlaybackAccountUnsupported = 27,
+            NarrationChanged = 28,
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -148,6 +149,12 @@ namespace LibreSpotUWP.Interop
 
             [MarshalAs(UnmanagedType.U1)]
             public bool was_preloaded;
+
+            [MarshalAs(UnmanagedType.U1)]
+            public bool is_narrating;
+
+            public uint narration_duration_ms;
+            public IntPtr narration_text;
         }
 
         [StructLayout(LayoutKind.Sequential)]
