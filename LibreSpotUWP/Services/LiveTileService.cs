@@ -1034,6 +1034,7 @@ namespace LibreSpotUWP.Services
                 track?.Album ?? string.Empty,
                 state.ArtworkUri ?? string.Empty,
                 state.ContextName ?? string.Empty,
+                state.IsNarrationActive.ToString(),
                 state.IsSpotifyConnectRemote.ToString(),
                 state.SpotifyConnectDeviceName ?? string.Empty
             });
@@ -1053,9 +1054,9 @@ namespace LibreSpotUWP.Services
                 Kind = LiveTileItemKind.Track,
                 Id = id,
                 Uri = metadata?.Uri ?? track?.Uri,
-                Title = SafeText(metadata?.Name, track?.Name),
-                Subtitle = SafeText(GetArtistLine(metadata), track?.Artist),
-                Detail = SafeText(metadata?.Album?.Name, track?.Album, state.ContextName),
+                Title = state.DisplayTitle,
+                Subtitle = state.DisplayArtist,
+                Detail = SafeText(state.DisplayAlbumTitle, state.ContextName),
                 ImageUrl = SafeText(
                     state.ArtworkUri,
                     metadata?.Album?.Images?.FirstOrDefault()?.Url,

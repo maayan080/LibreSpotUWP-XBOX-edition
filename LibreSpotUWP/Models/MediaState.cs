@@ -1,5 +1,7 @@
 ﻿using System;
 
+using System.Linq;
+
 namespace LibreSpotUWP.Models
 {
     public sealed class MediaState
@@ -22,6 +24,21 @@ namespace LibreSpotUWP.Models
         public string SpotifyConnectDeviceId { get; set; }
         public string SpotifyConnectDeviceName { get; set; }
         public bool IsSpotifyConnectRemote { get; set; }
+        public bool IsNarrationActive { get; set; }
+
+        public string DisplayTitle => IsNarrationActive
+            ? "Spotify DJ"
+            : Metadata?.Name ?? Track?.Name ?? string.Empty;
+
+        public string DisplayArtist => IsNarrationActive
+            ? "Spotify"
+            : Metadata?.Artists?.Count > 0
+                ? string.Join(", ", Metadata.Artists.Select(artist => artist?.Name).Where(name => !string.IsNullOrWhiteSpace(name)))
+                : Track?.Artist ?? string.Empty;
+
+        public string DisplayAlbumTitle => IsNarrationActive
+            ? string.Empty
+            : Metadata?.Album?.Name ?? Track?.Album ?? string.Empty;
 
         public bool IsPlaying => PlaybackState == LibrespotPlaybackState.Playing;
 
@@ -50,6 +67,7 @@ namespace LibreSpotUWP.Models
                 SpotifyConnectDeviceId = this.SpotifyConnectDeviceId,
                 SpotifyConnectDeviceName = this.SpotifyConnectDeviceName,
                 IsSpotifyConnectRemote = this.IsSpotifyConnectRemote,
+                IsNarrationActive = this.IsNarrationActive,
                 Shuffle = this.Shuffle,
                 RepeatMode = this.RepeatMode
             };

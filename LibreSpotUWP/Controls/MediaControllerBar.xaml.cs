@@ -395,6 +395,14 @@ namespace LibreSpotUWP.Controls
 
         private void UpdateArtistButton(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+            {
+                TrackArtistButton.Visibility = Visibility.Visible;
+                TrackArtistButton.IsEnabled = false;
+                ToolTipService.SetToolTip(TrackArtistButton, "Spotify");
+                return;
+            }
+
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = string.IsNullOrWhiteSpace(GetTrackArtist(state))
                 ? Visibility.Collapsed
@@ -407,22 +415,12 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackTitle(MediaState state)
         {
-            return FirstText(
-                state?.Metadata?.Name,
-                state?.Track?.Name,
-                "Unknown Track");
+            return FirstText(state?.DisplayTitle, "Unknown Track");
         }
 
         private static string GetTrackArtist(MediaState state)
         {
-            var metadataArtists = state?.Metadata?.Artists?
-                .Select(artist => artist?.Name)
-                .Where(name => !string.IsNullOrWhiteSpace(name));
-
-            return FirstText(
-                metadataArtists == null ? null : string.Join(", ", metadataArtists),
-                state?.Track?.Artist,
-                "Unknown Artist");
+            return FirstText(state?.DisplayArtist, "Unknown Artist");
         }
 
         private static string GetArtworkUri(MediaState state)

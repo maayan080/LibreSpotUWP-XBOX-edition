@@ -31,6 +31,12 @@ namespace LibreSpotUWP.Helpers
             if (_container == null || _text == null)
                 return;
 
+            if (state?.IsNarrationActive == true)
+            {
+                Hide();
+                return;
+            }
+
             if (!UserSettings.NowPlayingLyricsEnabled || state?.Track == null || string.IsNullOrWhiteSpace(state.Track.Uri))
             {
                 Hide();

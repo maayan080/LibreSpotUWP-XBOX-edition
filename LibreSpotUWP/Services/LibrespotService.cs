@@ -33,6 +33,7 @@ namespace LibreSpotUWP.Services
         private readonly SemaphoreSlim _connectGate = new SemaphoreSlim(1, 1);
 
         private readonly AudioKeyCache _audioKeyCache;
+        private readonly ISecureStorage _secureStorage;
 
         private AudioFormatProbeResult _audioFormat;
 
@@ -66,6 +67,7 @@ namespace LibreSpotUWP.Services
 
         public event EventHandler<LibrespotSessionState> SessionStateChanged;
         public event EventHandler<LibrespotTrackInfo> TrackChanged;
+        public event EventHandler<LibrespotNarrationState> NarrationChanged;
         public event EventHandler<LibrespotPlaybackState> PlaybackStateChanged;
         public event EventHandler<uint> PositionChanged;
         public event EventHandler<ushort> VolumeChanged;
@@ -76,9 +78,10 @@ namespace LibreSpotUWP.Services
         public event EventHandler<uint> RepeatChanged;
         public event EventHandler<uint> Seeked;
 
-        public LibrespotService(AudioKeyCache keyCache)
+        public LibrespotService(AudioKeyCache keyCache, ISecureStorage secureStorage)
         {
             _audioKeyCache = keyCache;
+            _secureStorage = secureStorage;
 
             _keyCallbackDelegate = OnKeyRequested;
             _keySaveDelegate = OnKeyReceived;
@@ -965,6 +968,16 @@ namespace LibreSpotUWP.Services
                     UpdatePosition(0);
                     break;
 
+                case EventType.NarrationChanged:
+                    var narration = new LibrespotNarrationState
+                    {
+                        TrackUri = ReadString(evt.data.track_uri),
+                        PlayRequestId = evt.data.play_request_id,
+                        IsActive = evt.data.is_narrating
+                    };
+                    RaiseOnMainThread(() => NarrationChanged?.Invoke(this, narration), nameof(NarrationChanged));
+                    break;
+
                 case EventType.PlaybackPaused:
                     LogService.Info($"{logPrefix} State -> Paused at {evt.data.position_ms}ms");
                     UpdatePlaybackState(LibrespotPlaybackState.Paused);
@@ -1194,7 +1207,10 @@ namespace LibreSpotUWP.Services
                 _instance = IntPtr.Zero;
             }
 
-            var cfg = BuildConfig(accessToken);
+            var playbackCredentialsJson = await _secureStorage
+                .LoadAsync(SpotifyAuthService.PlaybackCredentialsStorageKey)
+                .ConfigureAwait(false);
+            var cfg = BuildConfig(accessToken, playbackCredentialsJson);
             try
             {
                 _instance = Librespot.librespot_new(cfg, _callbackDelegate, IntPtr.Zero);
@@ -1209,7 +1225,7 @@ namespace LibreSpotUWP.Services
             await Task.CompletedTask;
         }
 
-        private LibrespotConfig BuildConfig(string accessToken)
+        private LibrespotConfig BuildConfig(string accessToken, string playbackCredentialsJson)
         {
             string deviceType;
             switch (AnalyticsInfo.VersionInfo.DeviceFamily)
@@ -1245,7 +1261,9 @@ namespace LibreSpotUWP.Services
                 initial_volume = initialVolume,
                 username = IntPtr.Zero,
                 password = IntPtr.Zero,
-                auth_blob = IntPtr.Zero,
+                auth_blob = string.IsNullOrWhiteSpace(playbackCredentialsJson)
+                    ? IntPtr.Zero
+                    : AllocUtf8String(playbackCredentialsJson),
                 access_token = AllocUtf8String(accessToken),
                 key_callback = _keyCallbackDelegate,
                 key_save_callback = _keySaveDelegate,

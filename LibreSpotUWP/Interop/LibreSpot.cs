@@ -99,6 +99,7 @@ namespace LibreSpotUWP.Interop
             Preloading = 22,
             TimeToPreloadNextTrack = 23,
             PositionChanged = 24,
+            NarrationChanged = 25,
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -140,6 +141,8 @@ namespace LibreSpotUWP.Interop
             public IntPtr session_user;
             public IntPtr client_name;
             public IntPtr log_msg;
+            [MarshalAs(UnmanagedType.U1)]
+            public bool is_narrating;
         }
 
         [StructLayout(LayoutKind.Sequential)]

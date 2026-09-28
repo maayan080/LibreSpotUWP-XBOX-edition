@@ -254,7 +254,7 @@ namespace LibreSpotUWP
             _secureStorage = new SecureStorage();
             KeyCache = new AudioKeyCache();
             await KeyCache.InitializeAsync();
-            Librespot = new LibrespotService(KeyCache);
+            Librespot = new LibrespotService(KeyCache, _secureStorage);
             SpotifyAuth = new SpotifyAuthService(_secureStorage);
             SpotifyWeb = new SpotifyWebService(SpotifyAuth, _metadataCache, Librespot);
             OfflineCatalog = new OfflineCatalogService();

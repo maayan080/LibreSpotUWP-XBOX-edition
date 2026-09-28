@@ -3,6 +3,7 @@ using LibreSpotUWP.Models;
 using LibreSpotUWP.Exceptions;
 using System;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 
@@ -30,7 +31,49 @@ namespace LibreSpotUWP.Helpers
         {
             try
             {
-                var importedState = Newtonsoft.Json.JsonConvert.DeserializeObject<AuthState>(json);
+                var loginPackage = JObject.Parse(json);
+                var format = (string)loginPackage["Format"];
+                AuthState importedState;
+                string playbackCredentialsJson = null;
+                string expectedAccountId = null;
+
+                if (string.Equals(format, "LibreSpotUWP.Login", StringComparison.Ordinal))
+                {
+                    var playback = loginPackage["Playback"] as JObject;
+                    importedState = loginPackage["Web"]?.ToObject<AuthState>();
+                    playbackCredentialsJson = (string)playback?["StoredCredentials"];
+
+                    if (importedState == null ||
+                        !string.Equals((string)playback?["Kind"], "storedCredentials", StringComparison.Ordinal) ||
+                        string.IsNullOrWhiteSpace(playbackCredentialsJson))
+                    {
+                        throw new InvalidOperationException("The sign-in package did not contain both account sessions.");
+                    }
+
+                    var playbackCredentials = JObject.Parse(playbackCredentialsJson);
+                    var accountId = (string)loginPackage["AccountId"];
+                    expectedAccountId = accountId;
+                    var playbackUser = (string)playbackCredentials["username"];
+                    var authType = (int?)playbackCredentials["auth_type"];
+                    var encodedAuthData = (string)playbackCredentials["auth_data"];
+
+                    if (string.IsNullOrWhiteSpace(accountId) ||
+                        !string.Equals(accountId, playbackUser, StringComparison.Ordinal) ||
+                        authType != 1 ||
+                        string.IsNullOrWhiteSpace(encodedAuthData) ||
+                        Convert.FromBase64String(encodedAuthData).Length == 0)
+                    {
+                        throw new InvalidOperationException("The playback session did not match the library account.");
+                    }
+                }
+                else
+                {
+                    if (!string.IsNullOrWhiteSpace(format))
+                        throw new InvalidOperationException("The sign-in package format is not supported.");
+
+                    importedState = loginPackage.ToObject<AuthState>();
+                }
+
                 if (importedState == null)
                     throw new InvalidOperationException("The sign-in details did not contain a valid session.");
 
@@ -70,7 +113,7 @@ namespace LibreSpotUWP.Helpers
                     return;
 
                 setBusy?.Invoke(true);
-                await auth.ImportAuthStateAsync(importedState);
+                await auth.ImportAuthStateAsync(importedState, playbackCredentialsJson, expectedAccountId);
 
                 var successDialog = new ContentDialog
                 {

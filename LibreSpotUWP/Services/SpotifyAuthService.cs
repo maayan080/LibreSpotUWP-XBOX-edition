@@ -24,6 +24,7 @@ namespace LibreSpotUWP.Services
         private string _pendingClientId;
 
         private const string StorageKey = "spotify_auth_state";
+        public const string PlaybackCredentialsStorageKey = "spotify_playback_credentials";
         private const int RequiredScopeVersion = 4;
         private const int RequiredAuthVersion = 1;
         private const string SpotifyMeEndpoint = "https://api.spotify.com/v1/me";
@@ -309,12 +310,20 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        public async Task ImportAuthStateAsync(AuthState state)
+        public async Task ImportAuthStateAsync(
+            AuthState state,
+            string playbackCredentialsJson = null,
+            string expectedAccountId = null)
         {
             if (state == null || string.IsNullOrEmpty(state.AccessToken) || !HasRequiredAuthSchema(state))
                 throw new ArgumentException("Invalid AuthState imported.");
 
-            await EnsurePremiumAccountAsync(state.AccessToken).ConfigureAwait(false);
+            await EnsurePremiumAccountAsync(state.AccessToken, expectedAccountId).ConfigureAwait(false);
+
+            if (string.IsNullOrWhiteSpace(playbackCredentialsJson))
+                await _storage.DeleteAsync(PlaybackCredentialsStorageKey).ConfigureAwait(false);
+            else
+                await _storage.SaveAsync(PlaybackCredentialsStorageKey, playbackCredentialsJson).ConfigureAwait(false);
 
             Current = state;
             Current.ClientId = ResolveStateClientId(Current);
@@ -382,7 +391,7 @@ namespace LibreSpotUWP.Services
             return null;
         }
 
-        private static async Task EnsurePremiumAccountAsync(string accessToken)
+        private static async Task EnsurePremiumAccountAsync(string accessToken, string expectedAccountId = null)
         {
             if (string.IsNullOrWhiteSpace(accessToken) || !ConnectivityHelper.HasInternetAccess())
                 return;
@@ -396,7 +405,15 @@ namespace LibreSpotUWP.Services
                     response.EnsureSuccessStatusCode();
 
                     var json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    var product = (string)JObject.Parse(json)["product"];
+                    var profile = JObject.Parse(json);
+                    var product = (string)profile["product"];
+                    var accountId = (string)profile["id"];
+
+                    if (!string.IsNullOrWhiteSpace(expectedAccountId) &&
+                        !string.Equals(expectedAccountId, accountId, StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException("The Web and playback sessions belong to different accounts.");
+                    }
 
                     if (!string.Equals(product, "premium", StringComparison.OrdinalIgnoreCase))
                     {
@@ -483,6 +500,7 @@ namespace LibreSpotUWP.Services
             Current = null;
             App.AuthToken = null;
             await _storage.DeleteAsync(StorageKey).ConfigureAwait(false);
+            await _storage.DeleteAsync(PlaybackCredentialsStorageKey).ConfigureAwait(false);
         }
 
         private async Task PersistStateAndNotifyAsync(AuthState state, bool reconnectLibrespot)

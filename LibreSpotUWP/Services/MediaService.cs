@@ -187,6 +187,7 @@ namespace LibreSpotUWP.Services
             _smtc.ButtonPressed += OnSmtcButtonPressed;
 
             _librespot.TrackChanged += OnTrackChanged;
+            _librespot.NarrationChanged += OnNarrationChanged;
             _librespot.PlaybackStateChanged += OnPlaybackChanged;
             _librespot.PositionChanged += OnPositionChanged;
             _librespot.SessionStateChanged += OnSessionStateChanged;
@@ -1649,6 +1650,7 @@ namespace LibreSpotUWP.Services
                     {
                         state.Track = null;
                         state.Metadata = null;
+                        state.IsNarrationActive = false;
                         state.PositionMs = 0;
                         state.DurationMs = 0;
                         state.IsCurrentTrackPersisted = false;
@@ -1665,6 +1667,7 @@ namespace LibreSpotUWP.Services
                 {
                     state.Track = track;
                     state.Metadata = null;
+                    state.IsNarrationActive = false;
                     state.DurationMs = (uint)track.Duration.TotalMilliseconds;
                     state.IsTrackMetadataFromCache = false;
                     state.IsCurrentTrackPersisted = App.OfflineCatalog.IsTrackPersisted(track.Uri);
@@ -1870,6 +1873,19 @@ namespace LibreSpotUWP.Services
             {
                 LogService.Error(ex, $"[MediaService.OnPlaybackChanged] Unhandled error while processing playback state {state}");
             }
+        }
+
+        private void OnNarrationChanged(object sender, LibrespotNarrationState narration)
+        {
+            if (!IsSelectedSpotifyConnectDeviceLocal || narration == null ||
+                !string.Equals(narration.TrackUri, Current.Track?.Uri, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            UpdateState(state => state.IsNarrationActive = narration.IsActive);
+            UpdateSmtcDisplay();
+            LogService.Info($"[MediaService.OnNarrationChanged] Spotify DJ narration {(narration.IsActive ? "started" : "ended")}.");
         }
 
         private void OnPositionChanged(object sender, uint positionMs)
@@ -2962,15 +2978,12 @@ namespace LibreSpotUWP.Services
             var updater = _smtc.DisplayUpdater;
             updater.Type = MediaPlaybackType.Music;
 
-            var t = _state.Metadata;
-            updater.MusicProperties.Title = t?.Name ?? _state.Track?.Name ?? string.Empty;
-            updater.MusicProperties.Artist = t != null
-                ? string.Join(", ", t.Artists?.Select(a => a.Name))
-                : _state.Track?.Artist ?? string.Empty;
-            updater.MusicProperties.AlbumTitle = t?.Album?.Name ?? _state.Track?.Album ?? string.Empty;
+            updater.MusicProperties.Title = _state.DisplayTitle;
+            updater.MusicProperties.Artist = _state.DisplayArtist;
+            updater.MusicProperties.AlbumTitle = _state.DisplayAlbumTitle;
 
             updater.Thumbnail = null;
-            if (TryCreateArtworkUri(_state.ArtworkUri, out var artworkUri))
+            if (!_state.IsNarrationActive && TryCreateArtworkUri(_state.ArtworkUri, out var artworkUri))
                 updater.Thumbnail = RandomAccessStreamReference.CreateFromUri(artworkUri);
 
             updater.Update();

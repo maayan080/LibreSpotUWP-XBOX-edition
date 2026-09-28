@@ -164,6 +164,7 @@
     <Compile Include="Helpers\ImageUriHelper.cs" />
     <Compile Include="Helpers\NowPlayingLyricsPresenter.cs" />
     <Compile Include="Helpers\PlaybackNavigationHelper.cs" />
+    <Compile Include="Helpers\SpotifyDjHelper.cs" />
     <Compile Include="Helpers\UserSettings.cs" />
     <Compile Include="Helpers\UwpBackgroundExecutionManager.cs" />
     <Compile Include="Helpers\UwpSettingsNavigator.cs" />
@@ -200,6 +201,7 @@
       <DependentUpon>ScannerPage.xaml</DependentUpon>
     </Compile>
     <Compile Include="Models\MediaState.cs" />
+    <Compile Include="Models\LibrespotNarrationState.cs" />
     <Compile Include="Models\AudioOutputDeviceInfo.cs" />
     <Compile Include="Models\SpotifyConnectDeviceInfo.cs" />
     <Compile Include="Models\EqualizerBandRange.cs" />

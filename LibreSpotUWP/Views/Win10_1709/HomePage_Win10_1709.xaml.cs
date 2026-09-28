@@ -1,4 +1,5 @@
 using LibreSpotUWP.Exceptions;
+using LibreSpotUWP.Helpers;
 using LibreSpotUWP.Interfaces;
 using LibreSpotUWP.Models;
 using LibreSpotUWP.ViewModels;
@@ -101,6 +102,13 @@ namespace LibreSpotUWP.Views.Win10_1709
                     break;
 
                 case FullPlaylist playlist:
+                    if (SpotifyDjHelper.IsHomeDjPlaylist(playlist))
+                    {
+                        mainPage.NavigateTo("Player");
+                        _ = PlayDjPlaylistAsync(playlist);
+                        break;
+                    }
+
                     mainPage.NavigateToPlaylist(playlist.Id);
                     LogService.Info($"Navigating to playlist: {playlist.Name}");
                     break;
@@ -125,6 +133,19 @@ namespace LibreSpotUWP.Views.Win10_1709
                 default:
                     LogService.Info("Unknown item type clicked: " + item.GetType().Name);
                     break;
+            }
+        }
+
+        private async Task PlayDjPlaylistAsync(FullPlaylist playlist)
+        {
+            try
+            {
+                await App.Media.PlayAsync(SpotifyDjHelper.GetPlaylistUri(playlist), null);
+                LogService.Info("Started Spotify DJ from the Home shortcut.");
+            }
+            catch (Exception ex)
+            {
+                LogService.Error(ex, "Unable to start Spotify DJ from the Home shortcut.");
             }
         }
 
