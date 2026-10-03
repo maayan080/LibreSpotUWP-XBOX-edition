@@ -201,7 +201,6 @@
     <Compile Include="Helpers\NavigationHelper.cs" />
     <Compile Include="Helpers\OSHelper.cs" />
     <Compile Include="Helpers\XboxExperience.cs" />
-    <Compile Include="Services\XboxPairingServer.cs" />
     <Compile Include="XboxLoginPage.xaml.cs">
       <DependentUpon>XboxLoginPage.xaml</DependentUpon>
     </Compile>
