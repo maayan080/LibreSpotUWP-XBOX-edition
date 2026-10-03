@@ -28,6 +28,7 @@ namespace LibreSpotUWP.Views.Win10_1507
         private DataTransferManager _dataTransferManager;
         private NowPlayingLyricsPresenter _lyricsPresenter;
         private bool _loadingOutputDevices;
+        private bool _changingOutputDevice;
         private bool _loadingSpotifyConnectDevices;
         private bool _spotifyConnectDropdownOpen;
         private bool _spotifyConnectRefreshPending;
@@ -109,11 +110,17 @@ namespace LibreSpotUWP.Views.Win10_1507
             {
                 _currentTrackUri = state.Track?.Uri;
 
-                TrackTitle.Text = state.Track?.Name ?? "";
-                TrackArtist.Text = state.Track?.Artist ?? "";
-                TotalTime.Text = Format(state.DurationMs);
-
             }
+
+            TrackTitle.Text = state.DisplayTitle;
+            TrackArtist.Text = state.IsNarrationActive ? "Spotify" : state.DisplayArtist;
+            NarrationTextBlock.Text = state.NarrationText ?? string.Empty;
+            NarrationTextBlock.Visibility = state.IsNarrationActive && !string.IsNullOrWhiteSpace(state.NarrationText)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            ToolTipService.SetToolTip(NarrationTextBlock, state.NarrationText);
+            TotalTime.Text = Format(state.DisplayDurationMs);
+            PositionSlider.IsEnabled = !state.IsNarrationActive;
 
             UpdateArtistButton(state);
             UpdateContextButton(state);
@@ -135,6 +142,9 @@ namespace LibreSpotUWP.Views.Win10_1507
 
             UpdateShuffleVisual(state.Shuffle);
             UpdateRepeatVisual(state.RepeatMode);
+            NextDjSetButton.Visibility = state.IsSpotifyDjContext && !string.IsNullOrWhiteSpace(state.NextDjSetUid)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
 
             VolumeSlider.ValueChanged -= VolumeSlider_ValueChanged;
             double volPercent = state.Volume * 100.0 / 65535.0;
@@ -148,9 +158,9 @@ namespace LibreSpotUWP.Views.Win10_1507
             {
                 _lastUpdateSec = currentSec;
 
-                if (PositionSlider.Maximum != state.DurationMs)
+                if (PositionSlider.Maximum != state.DisplayDurationMs)
                 {
-                    PositionSlider.Maximum = state.DurationMs;
+                    PositionSlider.Maximum = state.DisplayDurationMs;
                 }
 
                 PositionSlider.Value = state.PositionMs;
@@ -217,6 +227,11 @@ namespace LibreSpotUWP.Views.Win10_1507
         private void NextButton_Click(object sender, RoutedEventArgs e)
         {
             Media.Next();
+        }
+
+        private void NextDjSetButton_Click(object sender, RoutedEventArgs e)
+        {
+            Media?.NextSpotifyDjVibe();
         }
 
         private async void ShuffleButton_Click(object sender, RoutedEventArgs e) => await Media.SetShuffleAsync(!Media.Current.Shuffle);
@@ -303,10 +318,11 @@ namespace LibreSpotUWP.Views.Win10_1507
 
         private async Task LoadOutputDevicesAsync()
         {
-            if (Media == null || OutputDeviceComboBox == null)
+            if (Media == null || OutputDeviceComboBox == null || _loadingOutputDevices)
                 return;
 
             _loadingOutputDevices = true;
+            OutputDeviceComboBox.IsEnabled = false;
             try
             {
                 var devices = await Media.GetAudioOutputDevicesAsync();
@@ -318,15 +334,31 @@ namespace LibreSpotUWP.Views.Win10_1507
             finally
             {
                 _loadingOutputDevices = false;
+                OutputDeviceComboBox.IsEnabled = !_changingOutputDevice;
             }
         }
 
         private async void OutputDeviceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_loadingOutputDevices || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || Media == null)
+            if (_loadingOutputDevices || _changingOutputDevice || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || Media == null)
                 return;
 
-            await Media.SetAudioOutputDeviceAsync(device.Id);
+            _changingOutputDevice = true;
+            OutputDeviceComboBox.IsEnabled = false;
+            try
+            {
+                await Media.SetAudioOutputDeviceAsync(device.Id);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[PlayerPage_Win10_1507.OutputDeviceComboBox_SelectionChanged] Unable to change audio output: {ex}");
+                await LoadOutputDevicesAsync();
+            }
+            finally
+            {
+                _changingOutputDevice = false;
+                OutputDeviceComboBox.IsEnabled = !_loadingOutputDevices;
+            }
         }
 
         private async Task LoadSpotifyConnectDevicesAsync()
@@ -538,6 +570,12 @@ namespace LibreSpotUWP.Views.Win10_1507
 
         private void UpdateArtistButton(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+            {
+                TrackArtistButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = artists.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
             TrackArtistButton.IsEnabled = artists.Count > 0;

@@ -90,6 +90,21 @@ server (`XboxPairingServer`, plus its `privateNetworkClientServer` capability) w
 it depended on the desktop Login Helper, was never confirmed working on a console, and made
 the screen confusing.
 
+#### Playback authorization (upstream v1.0.5)
+
+Upstream now authorizes playback separately from library access (`SpotifyPlaybackAuthService`:
+the `streaming` scope, its own client ID, redirect `http://127.0.0.1:5588/login`, and a newer
+`librespot.dll` that accepts `playback_credentials`). Upstream's UI for it opens the system
+browser and asks you to paste the callback address, which cannot work on a console. On Xbox
+`XboxLoginPage` therefore runs it as a second step in the same WebView2: after the normal
+sign-in it navigates to the playback authorization page, intercepts the `:5588/login`
+redirect and calls `CompleteBrowserAuthorizationAsync`. If playback later needs
+re-authorizing, `PlaybackAuthorizationDialog` offers one **Authorize** button that reopens
+`XboxLoginPage` in playback-only mode. The first redirect (`:8898/login`) is unchanged.
+
+Upstream's account-compatibility warning is shown before sign-in. It does not fix the
+audio-key block on newer accounts; that is still unsolved upstream (librespot #1649).
+
 You can still enter your own client ID if you prefer; the built-in one is only a fallback.
 Note it belongs to the upstream author's Spotify app registration — if you intend heavy or
 long-term use, register your own at

@@ -1,4 +1,4 @@
-using LibreSpotUWP.Controls;
+﻿using LibreSpotUWP.Controls;
 using LibreSpotUWP.Helpers;
 using LibreSpotUWP.Models;
 using LibreSpotUWP.Services;
@@ -105,6 +105,8 @@ namespace LibreSpotUWP
                 Frame?.Navigate(typeof(XboxLoginPage));
                 return;
             }
+            if (!await AudioKeyCompatibilityWarning.ShowIfNeededAsync(allowCancel: true))
+                return;
 
             TxtAuthStatus.Text = "Waiting for Spotify to return to LibreSpotUWP...";
             await App.SpotifyAuth.BeginPkceLoginAsync();
@@ -291,8 +293,11 @@ namespace LibreSpotUWP
             XboxSignInPanel.Visibility = Visibility.Visible;
         }
 
-        private void BtnXboxSignIn_Click(object sender, RoutedEventArgs e)
+        private async void BtnXboxSignIn_Click(object sender, RoutedEventArgs e)
         {
+            if (!await AudioKeyCompatibilityWarning.ShowIfNeededAsync(allowCancel: true))
+                return;
+
             Frame?.Navigate(typeof(XboxLoginPage));
         }
 

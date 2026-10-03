@@ -31,7 +31,10 @@ namespace LibreSpotUWP.Services
         private const int RequiredAuthVersion = 1;
         private const string SpotifyMeEndpoint = "https://api.spotify.com/v1/me";
         private static readonly TimeSpan OfflinePersistenceLeaseDuration = TimeSpan.FromDays(30);
-        private static readonly HttpClient AccountHttpClient = new HttpClient();
+        private static readonly HttpClient AccountHttpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(20)
+        };
 
         public AuthState Current { get; private set; }
         public event EventHandler<AuthState> AuthStateChanged;
@@ -369,12 +372,18 @@ namespace LibreSpotUWP.Services
             }
         }
 
-        public async Task ImportAuthStateAsync(AuthState state)
+        public async Task ImportAuthStateAsync(AuthState state, string expectedAccountId = null)
         {
             if (state == null || string.IsNullOrEmpty(state.AccessToken) || !HasRequiredAuthSchema(state))
                 throw new ArgumentException("Invalid AuthState imported.");
 
-            await EnsurePremiumAccountAsync(state.AccessToken).ConfigureAwait(false);
+            var accountId = await EnsurePremiumAccountAsync(state.AccessToken).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(expectedAccountId) &&
+                !string.Equals(expectedAccountId, accountId, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "The Spotify Web session belongs to a different account than the sign-in package.");
+            }
 
             Current = state;
             Current.ClientId = ResolveStateClientId(Current);
@@ -442,10 +451,10 @@ namespace LibreSpotUWP.Services
             return null;
         }
 
-        private static async Task EnsurePremiumAccountAsync(string accessToken)
+        private static async Task<string> EnsurePremiumAccountAsync(string accessToken)
         {
             if (string.IsNullOrWhiteSpace(accessToken) || !ConnectivityHelper.HasInternetAccess())
-                return;
+                return null;
 
             using (var request = new HttpRequestMessage(HttpMethod.Get, SpotifyMeEndpoint))
             {
@@ -456,13 +465,20 @@ namespace LibreSpotUWP.Services
                     response.EnsureSuccessStatusCode();
 
                     var json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    var product = (string)JObject.Parse(json)["product"];
+                    var profile = JObject.Parse(json);
+                    var product = (string)profile["product"];
+                    var accountId = (string)profile["id"];
 
                     if (!string.Equals(product, "premium", StringComparison.OrdinalIgnoreCase))
                     {
                         LogService.Warn($"[SpotifyAuthService.EnsurePremiumAccountAsync] Rejected Spotify account product={product ?? "(null)"}.");
                         throw new SpotifyPremiumRequiredException(product);
                     }
+
+                    if (string.IsNullOrWhiteSpace(accountId))
+                        throw new InvalidOperationException("Spotify did not return an account identifier.");
+
+                    return accountId;
                 }
             }
         }

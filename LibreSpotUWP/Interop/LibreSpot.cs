@@ -49,6 +49,7 @@ namespace LibreSpotUWP.Interop
             public IntPtr password;
             public IntPtr auth_blob;
             public IntPtr access_token;
+            public IntPtr playback_credentials;
 
             public LibrespotKeyCallback key_callback;
             public LibrespotKeySaveCallback key_save_callback;
@@ -99,6 +100,11 @@ namespace LibreSpotUWP.Interop
             Preloading = 22,
             TimeToPreloadNextTrack = 23,
             PositionChanged = 24,
+            PlaybackKeyUnavailable = 25,
+            PlaybackAuthorizationRejected = 26,
+            PlaybackAccountUnsupported = 27,
+            NarrationChanged = 28,
+            DjStateChanged = 29,
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -144,6 +150,17 @@ namespace LibreSpotUWP.Interop
 
             [MarshalAs(UnmanagedType.U1)]
             public bool was_preloaded;
+
+            [MarshalAs(UnmanagedType.U1)]
+            public bool is_narrating;
+
+            public uint narration_duration_ms;
+            public IntPtr narration_text;
+
+            [MarshalAs(UnmanagedType.U1)]
+            public bool is_dj;
+
+            public IntPtr dj_next_set_uid;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -341,6 +358,9 @@ namespace LibreSpotUWP.Interop
         public static extern void librespot_next(IntPtr inst);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern void librespot_dj_next_set(IntPtr inst, IntPtr expectedUid);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void librespot_prev(IntPtr inst);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -433,6 +453,9 @@ namespace LibreSpotUWP.Interop
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern void librespot_string_free(IntPtr value);
+
+        [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr librespot_get_playback_credentials(IntPtr inst);
 
         [DllImport("librespot.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr librespot_track_get(IntPtr inst, IntPtr argument);

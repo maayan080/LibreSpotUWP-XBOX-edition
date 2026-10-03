@@ -264,6 +264,13 @@ namespace LibreSpotUWP.Views.Win11
                 return;
             }
 
+            if (tag == "SpotifyDj")
+            {
+                if (await EnsureAuthenticatedAsync())
+                    await SpotifyDjHelper.StartHomeDjAsync(this);
+                return;
+            }
+
             await Task.Yield();
             NavigateTo(tag, true);
         }

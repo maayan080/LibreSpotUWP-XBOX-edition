@@ -46,8 +46,8 @@ namespace LibreSpotUWP.Interfaces
         string DeviceId { get; }
         string DeviceName { get; }
 
-        Task ConnectWithAccessTokenAsync(string accessToken);
-        Task ReconnectWithAccessTokenAsync(string accessToken);
+        Task ConnectWithPlaybackAuthAsync(PlaybackConnectionMaterial authorization);
+        Task ReconnectWithPlaybackAuthAsync(PlaybackConnectionMaterial authorization);
         Task DisconnectAsync();
         Task<LibrespotTrackData> GetTrackAsync(string trackUri);
         Task<LibrespotAlbumData> GetAlbumAsync(string albumUri);
@@ -77,10 +77,13 @@ namespace LibreSpotUWP.Interfaces
         uint GetPositionMs();
         void Seek(uint posMs);
         void Next();
+        void NextDjSet(string expectedUid);
         void Previous();
 
         event EventHandler<LibrespotSessionState> SessionStateChanged;
         event EventHandler<LibrespotTrackInfo> TrackChanged;
+        event EventHandler<LibrespotNarrationState> NarrationChanged;
+        event EventHandler<LibrespotDjState> DjStateChanged;
         event EventHandler<LibrespotPlaybackState> PlaybackStateChanged;
         event EventHandler<LibrespotPlaybackEvent> PlaybackEvent;
         event EventHandler<LibrespotPositionUpdate> PositionChanged;
@@ -92,6 +95,9 @@ namespace LibreSpotUWP.Interfaces
         event EventHandler<LibrespotTrackBoundaryInfo> TrackPreloading;
         event EventHandler<string> LogMessage;
         event EventHandler<string> Panic;
+        event EventHandler<PlaybackCredentialsEventArgs> PlaybackCredentialsAvailable;
+        event EventHandler PlaybackAuthorizationRejected;
+        event EventHandler PlaybackAccountUnsupported;
     }
 
 }

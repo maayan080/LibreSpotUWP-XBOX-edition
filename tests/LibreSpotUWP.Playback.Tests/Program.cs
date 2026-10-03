@@ -16,9 +16,20 @@ internal static class Program
         var tests = new Action[]
         {
             HomeRequestsUseArmSafeBoundedConcurrency,
+            HomePublishesSecondarySectionsIndependently,
+            SessionCacheLifetimeIsFiniteAndExplicit,
+            NativeSessionReadinessWaitsForAuthentication,
+            ReportedNetworkAndAudioFailurePathsAreHardened,
+            WindowsMobileStorageAndXAudio28RoutingAreHardened,
+            AudioKeyCompatibilityWarningCoversEverySignInPath,
+            PlaybackAuthorizationBoundaryIsSeparated,
+            PlaybackAccountIdentityIsVerifiedAfterNativeAuthentication,
+            VolumeSliderWorkIsCoalesced,
             NavigationCancelsOldHomeGeneration,
             StaleHomeResultsCannotUpdateReplacementGeneration,
             TileRefreshBurstProducesOneUpdate,
+            LiveTileUpdatesAreImmediateAndDurable,
+            BackgroundingPreservesActiveLocalPlayback,
             RepetitiveTelemetryProducesOneSinkEntry,
             PlaybackEventStormCreatesOnePendingDispatcherItem,
             MetadataAndLyricsCompletionCannotOutliveNavigation,
@@ -57,6 +68,7 @@ internal static class Program
             OldSessionEventsCannotChangeReplacementSession,
             GraphDisposalWaitsForCallbacksInFlight,
             SuccessfulNormalPreloadAndHandoff,
+            PlaylistBoundaryRejectsAlbumContinuation,
             UnavailableSpotifyContextUsesApplicationFallback,
             EmptyInternalQueueUsesApplicationFallback,
             NoTrackChangedAfterEndUsesFallback,
@@ -90,6 +102,332 @@ internal static class Program
         }
     }
 
+    private static void SessionCacheLifetimeIsFiniteAndExplicit()
+    {
+        var now = new DateTimeOffset(2026, 7, 24, 12, 0, 0, TimeSpan.Zero);
+        Assert(CacheFreshness.IsStale(now, TimeSpan.Zero, now),
+            "zero TTL did not force an immediate refresh");
+        Assert(!CacheFreshness.IsStale(now.AddMinutes(-4), TimeSpan.FromMinutes(5), now),
+            "fresh session data was treated as stale");
+        Assert(CacheFreshness.IsStale(now.AddMinutes(-5), TimeSpan.FromMinutes(5), now),
+            "expired session data was treated as fresh");
+        Assert(!CacheFreshness.IsStale(now.AddYears(-10), TimeSpan.MaxValue, now),
+            "immutable cached data expired");
+    }
+
+    private static void NativeSessionReadinessWaitsForAuthentication()
+    {
+        var ready = false;
+        var valid = true;
+        var completion = SessionReadinessWaiter.WaitAsync(
+            () => Volatile.Read(ref ready),
+            () => Volatile.Read(ref valid),
+            TimeSpan.FromSeconds(1),
+            CancellationToken.None);
+
+        Task.Delay(75).ContinueWith(_ => Volatile.Write(ref ready, true)).GetAwaiter().GetResult();
+        completion.GetAwaiter().GetResult();
+
+        ready = false;
+        valid = false;
+        AssertThrows<InvalidOperationException>(() => SessionReadinessWaiter.WaitAsync(
+            () => Volatile.Read(ref ready),
+            () => Volatile.Read(ref valid),
+            TimeSpan.FromSeconds(1),
+            CancellationToken.None).GetAwaiter().GetResult(),
+            "an invalidated native session did not fail immediately");
+
+        valid = true;
+        AssertThrows<TimeoutException>(() => SessionReadinessWaiter.WaitAsync(
+            () => false,
+            () => Volatile.Read(ref valid),
+            TimeSpan.FromMilliseconds(75),
+            CancellationToken.None).GetAwaiter().GetResult(),
+            "native session readiness was not bounded by a timeout");
+    }
+
+    private static void ReportedNetworkAndAudioFailurePathsAreHardened()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var appRoot = Path.Combine(repositoryRoot, "LibreSpotUWP");
+        var spotify = File.ReadAllText(Path.Combine(appRoot, "Services", "SpotifyWebService.cs"));
+        Assert(spotify.Contains("RequestTimeout = TimeSpan.FromSeconds(20)") &&
+               spotify.Contains("_httpClient.SetRequestTimeout(RequestTimeout)") &&
+               spotify.Contains("TtlSession = TimeSpan.FromMinutes(5)"),
+            "Spotify requests or session cache lifetime are not explicitly bounded");
+
+        var librespot = File.ReadAllText(Path.Combine(appRoot, "Services", "LibrespotService.cs"));
+        Assert(librespot.Contains("await FreeNativeInstanceAsync(instance, \"access-token-recreation\")") &&
+               librespot.Contains("Task.Run(() => Librespot.librespot_free(instance))"),
+            "native session recreation can still synchronously join the runner");
+        Assert(librespot.Contains("WaitForConnectedNativeInstanceAsync") &&
+               librespot.Contains("_session.IsConnected") &&
+               librespot.Contains("EventType.PlaybackKeyUnavailable"),
+            "native metadata requests or audio-key failures are not session-safe");
+
+        var media = File.ReadAllText(Path.Combine(appRoot, "Services", "MediaService.cs"));
+        var createReplacement = media.IndexOf(
+            "replacementPlayer = await CreateAudioPlayerAsync(backend, outputDeviceId)",
+            StringComparison.Ordinal);
+        var publishReplacement = media.IndexOf(
+            "_ringPlayer = replacementPlayer",
+            createReplacement,
+            StringComparison.Ordinal);
+        var disposePrevious = media.IndexOf(
+            "await previousPlayer.DisposeAsync()",
+            publishReplacement,
+            StringComparison.Ordinal);
+        Assert(createReplacement >= 0 &&
+               publishReplacement > createReplacement &&
+               disposePrevious > publishReplacement,
+            "audio output replacement is not committed before the previous player is disposed");
+        Assert(media.Contains("liveNativeSwitch={backend != AudioBackendKind.RingBuffer}") &&
+               media.Contains("UserSettings.AudioOutputDeviceId = deviceId;") &&
+               media.Contains("(_ringPlayer as NativeWindowsAudioPlayer)?.CommitOutputDevice(deviceId)"),
+            "native output-device changes do not update both the renderer and its managed controller");
+
+        var themes = new[] { "Win10_1507", "Win10_1709", "Win11" };
+        foreach (var theme in themes)
+        {
+            var playerPage = File.ReadAllText(Path.Combine(
+                appRoot,
+                "Views",
+                theme,
+                "PlayerPage_" + theme + ".xaml.cs"));
+            Assert(playerPage.Contains("Unable to change audio output") &&
+                   playerPage.Contains("await LoadOutputDevicesAsync();") &&
+                   playerPage.Contains("_changingOutputDevice") &&
+                   playerPage.Contains("OutputDeviceComboBox.IsEnabled = false;"),
+                "output-device loading or failure recovery is missing from " + theme);
+        }
+
+        var mediaController = File.ReadAllText(Path.Combine(appRoot, "Controls", "MediaControllerBar.xaml.cs"));
+        Assert(mediaController.Contains("MediaControllerBar.OutputDeviceComboBox_SelectionChanged") &&
+               mediaController.Contains("await LoadOutputDevicesAsync();") &&
+               mediaController.Contains("_changingOutputDevice") &&
+               mediaController.Contains("OutputDeviceComboBox.IsEnabled = false;"),
+            "compact media-bar output-device selection is not race-safe");
+
+        Assert(media.Contains("HandleAudioKeyUnavailable(playbackEvent)") &&
+               media.Contains("Playback stopped without queue skipping"),
+            "Spotify audio-key rejection can still feed the decoder or skip the entire queue");
+    }
+
+    private static void PlaybackAuthorizationBoundaryIsSeparated()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var appRoot = Path.Combine(repositoryRoot, "LibreSpotUWP");
+        var workspaceRoot = Directory.GetParent(repositoryRoot).FullName;
+        var rustRoot = Path.Combine(workspaceRoot, "librespot");
+        var helperRoot = Path.Combine(workspaceRoot, "LibreSpotUWPLoginHelper");
+
+        var app = File.ReadAllText(Path.Combine(appRoot, "App.xaml.cs"));
+        Assert(app.Contains("SpotifyPlaybackAuth.GetConnectionMaterialAsync()") &&
+               !app.Contains("ConnectWithAccessTokenAsync(token)") &&
+               app.Contains("quarantining it and continuing without playback") &&
+               app.Contains("await SpotifyPlaybackAuth.MarkRejectedAsync()"),
+            "startup still supplies the Spotify Web API token to native playback");
+
+        var playbackAuth = File.ReadAllText(Path.Combine(
+            appRoot,
+            "Services",
+            "SpotifyPlaybackAuthService.cs"));
+        Assert(playbackAuth.Contains("spotify_playback_auth_state") &&
+               playbackAuth.Contains("PlaybackClientId") &&
+               playbackAuth.Contains("PlaybackRedirectUri") &&
+               playbackAuth.Contains("Timeout = TimeSpan.FromSeconds(30)") &&
+               playbackAuth.Contains("RequiredAuthVersion = 2") &&
+               playbackAuth.Contains("Uri.EscapeDataString(\"streaming\")") &&
+               !playbackAuth.Contains("ValidateBootstrapAccountAsync") &&
+               !playbackAuth.Contains("api.spotify.com/v1/me") &&
+               playbackAuth.Contains("SaveReusableCredentialsAsync") &&
+               playbackAuth.Contains("PlaybackAccountIdentityValidator.EnsureConsistent") &&
+               playbackAuth.Contains("state.Status = PlaybackAuthorizationStatus.Rejected"),
+            "playback authorization is not independently stored or bounded");
+
+        var spotifyWeb = File.ReadAllText(Path.Combine(appRoot, "Services", "SpotifyWebService.cs"));
+        Assert(spotifyWeb.Contains("c.UserProfile.Current(ct)") &&
+               spotifyWeb.Contains("playback is waiting for its separate one-time authorization"),
+            "the Web account identity incorrectly depends on an authorized native playback session");
+
+        var nativeService = File.ReadAllText(Path.Combine(appRoot, "Services", "LibrespotService.cs"));
+        Assert(nativeService.Contains("authorization.BootstrapAccessToken") &&
+               nativeService.Contains("authorization.StoredCredentials") &&
+               nativeService.Contains("librespot_get_playback_credentials") &&
+               nativeService.Contains("PlaybackAuthorizationRejected"),
+            "managed/native playback credential exchange or rejection reporting is incomplete");
+
+        var loginPackage = File.ReadAllText(Path.Combine(appRoot, "Models", "LoginPackage.cs"));
+        var qrImport = File.ReadAllText(Path.Combine(appRoot, "Helpers", "QrLoginHelper.cs"));
+        Assert(loginPackage.Contains("CurrentVersion = 3") &&
+               loginPackage.Contains("PlaybackAuthorizationPackage") &&
+               qrImport.Contains("loginPackage.Playback,") &&
+               qrImport.Contains("loginPackage.AccountId") &&
+               qrImport.Contains("legacy Spotify Web session"),
+            "versioned QR import does not distinguish Web and playback authorization");
+
+        var rustConfig = File.ReadAllText(Path.Combine(rustRoot, "src", "config.rs"));
+        var rustRunner = File.ReadAllText(Path.Combine(rustRoot, "src", "runner.rs"));
+        var login5 = File.ReadAllText(Path.Combine(rustRoot, "core", "src", "login5.rs"));
+        var rustSession = File.ReadAllText(Path.Combine(rustRoot, "core", "src", "session.rs"));
+        Assert(rustConfig.Contains("AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS") &&
+               rustConfig.Contains("Authenticating via playback bootstrap token") &&
+               rustRunner.Contains("PlaybackAuthorizationRejected") &&
+               rustRunner.Contains("PlaybackAccountUnsupported") &&
+               rustRunner.Contains("last_creds = None") &&
+               login5.Contains("Error::unauthenticated(err)") &&
+               !rustSession.Contains("process::exit") &&
+               !rustSession.Contains("exit(1)"),
+            "native playback authorization does not stop and surface login5 rejection");
+
+        var helperWindow = File.ReadAllText(Path.Combine(helperRoot, "MainWindow.xaml.cs"));
+        var helperTokenExchange = File.ReadAllText(Path.Combine(
+            helperRoot,
+            "Services",
+            "SpotifyTokenExchangeService.cs"));
+        var helperPackage = File.ReadAllText(Path.Combine(helperRoot, "Models", "LoginPackage.cs"));
+        Assert(helperWindow.Contains("65b708073fc0480ea92a077233ca87bd") &&
+               helperWindow.Contains("PlaybackLoopbackPort = 5588") &&
+               helperWindow.Contains("BuildPlaybackAuthOptions") &&
+               helperWindow.Contains("new[] { \"streaming\" }") &&
+               helperWindow.Contains("will verify the playback account during its first native connection") &&
+               helperTokenExchange.Split(new[] { "GetPremiumAccountIdAsync(" }, StringSplitOptions.None).Length - 1 == 1 &&
+               helperPackage.Contains("CurrentVersion = 3") &&
+               helperPackage.Contains("AuthVersion { get; set; } = 2") &&
+               helperPackage.Contains("PlaybackAuthorizationPackage"),
+            "Login Helper does not emit the two-stage versioned login package");
+    }
+
+    private static void PlaybackAccountIdentityIsVerifiedAfterNativeAuthentication()
+    {
+        PlaybackAccountIdentityValidator.EnsureConsistent(
+            "matching-user",
+            "MATCHING-USER",
+            "matching-user");
+
+        AssertThrows<InvalidOperationException>(
+            () => PlaybackAccountIdentityValidator.EnsureConsistent(
+                "library-user",
+                "other-user",
+                "other-user"),
+            "a playback account different from the Web/library account was accepted");
+        AssertThrows<InvalidOperationException>(
+            () => PlaybackAccountIdentityValidator.EnsureConsistent(
+                "library-user",
+                "library-user",
+                "other-session-user"),
+            "inconsistent native session and reusable credential identities were accepted");
+        AssertThrows<InvalidOperationException>(
+            () => PlaybackAccountIdentityValidator.EnsureConsistent(
+                null,
+                "library-user",
+                "library-user"),
+            "a playback credential without a linked Web/library account was accepted");
+    }
+
+    private static void VolumeSliderWorkIsCoalesced()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var media = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "LibreSpotUWP",
+            "Services",
+            "MediaService.cs"));
+        var setterStart = media.IndexOf("public void SetVolumeDebounced", StringComparison.Ordinal);
+        var applyStart = media.IndexOf("private async Task ApplyPendingVolumeAsync", setterStart, StringComparison.Ordinal);
+        var setter = media.Substring(setterStart, applyStart - setterStart);
+
+        Assert(setterStart >= 0 && applyStart > setterStart,
+            "debounced volume apply pipeline is missing");
+        Assert(!setter.Contains("settings.Values[VolumeKey]") &&
+               !setter.Contains("UpdateState(s =>"),
+            "volume slider still performs storage or broadcast work for every pixel");
+        Assert(setter.Contains("UpdateStateWithoutNotification") &&
+               media.Contains("Interlocked.CompareExchange(ref _volumeUpdateRunning") &&
+               media.Contains("version != Volatile.Read(ref _volumeVersion)"),
+            "volume updates are not coalesced or stale-request safe");
+    }
+
+    private static void WindowsMobileStorageAndXAudio28RoutingAreHardened()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var appRoot = Path.Combine(repositoryRoot, "LibreSpotUWP");
+        var media = File.ReadAllText(Path.Combine(appRoot, "Services", "MediaService.cs"));
+        Assert(!media.Contains("xaudio2-explicit-output-fallback") &&
+               !media.Contains("effectiveBackend = AudioBackendKind.RustWasapi") &&
+               media.Contains("NativeWindowsAudioPlayer.SelectBackendAsync(backend, deviceId)"),
+            "an output change substitutes WASAPI for the selected XAudio2 backend");
+
+        var rustRoot = Path.Combine(
+            Directory.GetParent(repositoryRoot).FullName,
+            "librespot",
+            "playback",
+            "src",
+            "audio_backend");
+        var xaudio2 = File.ReadAllText(Path.Combine(rustRoot, "uwp_xaudio2.rs"));
+        var uwp = File.ReadAllText(Path.Combine(rustRoot, "uwp.rs"));
+        var endpointCompatibility = File.ReadAllText(Path.Combine(
+            rustRoot,
+            "uwp_xaudio2_endpoint.rs"));
+        Assert(xaudio2.Contains("#[link(name = \"xaudio2_8\")]") &&
+               !xaudio2.Contains("#[link(name = \"xaudio2\")]"),
+            "the UWP XAudio2 backend does not explicitly bind the Windows Phone-compatible 2.8 runtime");
+        Assert(uwp.Contains("XAudio2EndpointSink::new") &&
+               uwp.Contains("Err(xaudio_error) if !device.is_empty()") &&
+               endpointCompatibility.Contains("WasapiSink") &&
+               endpointCompatibility.Contains("SoftwareEffects") &&
+               endpointCompatibility.Contains("disabled_compatibility_effects_are_bit_exact") &&
+               endpointCompatibility.Contains("maximum_compatibility_effects_remain_finite_and_bounded"),
+            "XAudio2 cannot retain its effects profile when Mobile rejects an explicit endpoint");
+
+        var storageHelper = File.ReadAllText(Path.Combine(
+            appRoot,
+            "Helpers",
+            "StorageStatisticsHelper.cs"));
+        Assert(storageHelper.Contains("await folder.GetItemsAsync()") &&
+               storageHelper.Contains("await file.GetBasicPropertiesAsync()") &&
+               !storageHelper.Contains("Directory.EnumerateFiles"),
+            "storage statistics do not use the WinRT storage broker");
+
+        foreach (var theme in new[] { "Win10_1507", "Win10_1709", "Win11" })
+        {
+            var settings = File.ReadAllText(Path.Combine(
+                appRoot,
+                "Views",
+                theme,
+                "SettingsPage_" + theme + ".xaml.cs"));
+            Assert(settings.Contains("StorageStatisticsHelper.GetChildFolderStatsAsync") &&
+                   settings.Contains("FormatStorageStatus") &&
+                   !settings.Contains("Directory.EnumerateFiles"),
+                "brokered and independent storage statistics are missing from " + theme);
+        }
+    }
+
+    private static void AudioKeyCompatibilityWarningCoversEverySignInPath()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var appRoot = Path.Combine(repositoryRoot, "LibreSpotUWP");
+        var warning = File.ReadAllText(Path.Combine(appRoot, "Helpers", "AudioKeyCompatibilityWarning.cs"));
+        Assert(warning.Contains("Some Spotify accounts created after 2024") &&
+               warning.Contains("Spotify does not expose an account creation date") &&
+               warning.Contains("librespot-org/librespot/issues/1649") &&
+               warning.Contains("Don't show this warning again") &&
+               warning.Contains("UserSettings.HideAudioKeyCompatibilityWarning = true"),
+            "the audio-key compatibility warning is incomplete or cannot be suppressed");
+
+        var app = File.ReadAllText(Path.Combine(appRoot, "App.xaml.cs"));
+        var oobe = File.ReadAllText(Path.Combine(appRoot, "OobePage.xaml.cs"));
+        var qr = File.ReadAllText(Path.Combine(appRoot, "Helpers", "QrLoginHelper.cs"));
+        var account = File.ReadAllText(Path.Combine(appRoot, "Controls", "SpotifyAccountControl.xaml.cs"));
+        Assert(app.Contains("if (isSignedIn)") &&
+               app.Contains("await AudioKeyCompatibilityWarning.ShowIfNeededAsync();"),
+            "already-signed-in upgrades do not show the audio-key compatibility warning");
+        Assert(oobe.Contains("ShowIfNeededAsync(allowCancel: true)") &&
+               qr.Contains("await AudioKeyCompatibilityWarning.ShowIfNeededAsync();") &&
+               account.Contains("ShowIfNeededAsync(allowCancel: true)"),
+            "one or more LibreSpotUWP sign-in paths bypass the audio-key compatibility warning");
+    }
+
     private static void HomeRequestsUseArmSafeBoundedConcurrency()
     {
         using (var gate = new BoundedAsyncGate(3))
@@ -115,6 +453,29 @@ internal static class Program
             Assert(maximum == 3, "Home request gate did not exercise the configured ARM-safe concurrency");
             Assert(gate.MaximumObserved == 3, "Home request concurrency diagnostics were incorrect");
         }
+    }
+
+    private static void HomePublishesSecondarySectionsIndependently()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var home = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "LibreSpotUWP",
+            "ViewModels",
+            "HomePageViewModel.cs"));
+        var buildStart = home.IndexOf("private async Task<HomeSnapshot> BuildOnlineSnapshotAsync", StringComparison.Ordinal);
+        var enrichmentStart = home.IndexOf("private void StartAlbumEnrichment", buildStart, StringComparison.Ordinal);
+        var build = home.Substring(buildStart, enrichmentStart - buildStart);
+
+        Assert(build.Contains("await Task.WhenAny(remaining)") &&
+               build.Contains("incrementalProgress?.Report(update)") &&
+               !build.Contains("Task.WhenAll(playlistsTask, artistsTask, tracksTask, savedTask, followedTask)"),
+            "Home secondary sections still wait behind the slowest request");
+        Assert(home.Contains("ApplyIncrementalSnapshot(update)") &&
+               home.Contains("ReplaceHomeGroup(\"Your Playlists\"") &&
+               home.Contains("ReplaceHomeGroup(\"Saved Albums\"") &&
+               home.Contains("StartAlbumEnrichment(spotify, update.Snapshot"),
+            "Home section completions are not published incrementally");
     }
 
     private static void NavigationCancelsOldHomeGeneration()
@@ -164,6 +525,123 @@ internal static class Program
         Assert(request.Force, "tile burst lost its merged force-refresh flag");
         Assert(request.Reasons.Split('+').Length == 4, "tile burst did not merge refresh reasons");
         Assert(!coalescer.CompleteOrContinue(), "tile burst left a second OS update pending");
+
+        var delayed = due.AddSeconds(10);
+        var immediate = due.AddSeconds(1);
+        Assert(coalescer.Enqueue(false, "launch", delayed), "delayed tile refresh did not start a worker");
+        Assert(!coalescer.Enqueue(false, "media", immediate), "urgent tile refresh started a second worker");
+        Assert(coalescer.TryTake(immediate, out request, out remaining),
+            "urgent media refresh was postponed behind delayed tile work");
+        Assert(request.Reasons.Contains("launch") && request.Reasons.Contains("media"),
+            "urgent tile refresh lost a merged reason");
+        Assert(!coalescer.CompleteOrContinue(), "urgent tile refresh left extra work pending");
+    }
+
+    private static void LiveTileUpdatesAreImmediateAndDurable()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var appRoot = Path.Combine(repositoryRoot, "LibreSpotUWP");
+        var liveTile = File.ReadAllText(Path.Combine(appRoot, "Services", "LiveTileService.cs"));
+        var app = File.ReadAllText(Path.Combine(appRoot, "App.xaml.cs"));
+        var manifest = File.ReadAllText(Path.Combine(appRoot, "Package.appxmanifest"));
+
+        Assert(!liveTile.Contains("MinimumOsUpdateInterval"),
+            "live tile still imposes a fixed delay on meaningful media changes");
+        Assert(liveTile.Contains("reason: \"media\"") &&
+               liveTile.Contains("reason: \"launch\"") &&
+               CountOccurrences(liveTile, "delay: TimeSpan.Zero") >= 3,
+            "media or launch tile refresh is not immediate");
+        Assert(liveTile.Contains("RefreshMediaTileImmediatelyAsync") &&
+               liveTile.Contains("reason: \"media-immediate\"") &&
+               liveTile.Contains("CreateImmediateIdleNotification") &&
+               liveTile.Contains("_tileUpdateGate") &&
+               liveTile.Contains("_mediaRevision"),
+            "media-state tiles still wait behind the network-enrichment worker");
+        var immediateStart = liveTile.IndexOf(
+            "private async Task RefreshMediaTileImmediatelyAsync",
+            StringComparison.Ordinal);
+        var applyStart = liveTile.IndexOf(
+            "private async Task<bool> ApplyNotificationsIfCurrentAsync",
+            StringComparison.Ordinal);
+        Assert(immediateStart >= 0 && applyStart > immediateStart,
+            "immediate current-track tile method could not be inspected");
+        var immediateBody = liveTile.Substring(immediateStart, applyStart - immediateStart);
+        Assert(!immediateBody.Contains("EnsureTileDataAsync"),
+            "immediate media-state tiles still perform network enrichment");
+        Assert(immediateBody.Contains("nowPlaying") &&
+               immediateBody.Contains("CreateImmediateIdleNotification"),
+            "playback stopping cannot immediately replace stale Now Playing content");
+        Assert(liveTile.Contains("_refreshWakeSignal.WaitAsync(remainingDelay)") &&
+               liveTile.Contains("_refreshWakeSignal.Release()"),
+            "an urgent tile refresh cannot wake a delayed worker");
+        Assert(liveTile.Contains("new ScheduledTileNotification") &&
+               liveTile.Contains("GetScheduledTileNotifications") &&
+               liveTile.Contains("RemoveFromSchedule") &&
+               liveTile.Contains("AddToSchedule"),
+            "live tile does not schedule and replace its song-boundary fallback");
+        Assert(liveTile.Contains("state.DisplayDurationMs.ToString()") &&
+               liveTile.Contains("state.DisplayDurationMs > 0") &&
+               liveTile.Contains(": 0;") &&
+               liveTile.Contains("notification.ExpirationTime.Value.UtcDateTime.Ticks"),
+            "live tile does not reschedule when duration arrives or expire promptly at track end");
+        Assert(liveTile.Contains("public void RefreshAfterResuming()") &&
+               app.Contains("LiveTiles?.RefreshAfterResuming()"),
+            "live tile is not reconciled when a suspended app resumes");
+        Assert(manifest.Contains("<uap:ShowNameOnTiles>") &&
+               manifest.Contains("ShortName=\"LibreSpotUWP\""),
+            "the default tile has no visible identity before the first app launch");
+    }
+
+    private static void BackgroundingPreservesActiveLocalPlayback()
+    {
+        Assert(BackgroundPlaybackPolicy.ShouldKeepRunning(
+                isLocalDevice: true,
+                playbackRequested: true,
+                isPlayingOrLoading: true),
+            "active local playback was not classified as background-capable");
+        Assert(!BackgroundPlaybackPolicy.ShouldKeepRunning(
+                isLocalDevice: false,
+                playbackRequested: true,
+                isPlayingOrLoading: true),
+            "remote Spotify Connect playback was classified as local background audio");
+        Assert(!BackgroundPlaybackPolicy.ShouldKeepRunning(
+                isLocalDevice: true,
+                playbackRequested: false,
+                isPlayingOrLoading: true),
+            "a user-paused transport was classified as active background audio");
+        Assert(!BackgroundPlaybackPolicy.ShouldKeepRunning(
+                isLocalDevice: true,
+                playbackRequested: true,
+                isPlayingOrLoading: false),
+            "an idle local transport was classified as active background audio");
+
+        var repositoryRoot = FindRepositoryRoot();
+        var media = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "LibreSpotUWP",
+            "Services",
+            "MediaService.cs"));
+        var prepareStart = media.IndexOf(
+            "public Task PrepareForSuspendingAsync()",
+            StringComparison.Ordinal);
+        var resumeStart = prepareStart >= 0
+            ? media.IndexOf(
+                "public Task ResumeAfterSuspendingAsync()",
+                prepareStart,
+                StringComparison.Ordinal)
+            : -1;
+        Assert(prepareStart >= 0 && resumeStart > prepareStart,
+            "background playback lifecycle methods could not be inspected");
+
+        var prepare = media.Substring(prepareStart, resumeStart - prepareStart);
+        Assert(prepare.Contains("BackgroundPlaybackPolicy.ShouldKeepRunning") &&
+               prepare.Contains("_mediaPlayer.Play()") &&
+               prepare.Contains("PersistPlaybackSnapshot(forceWrite: true)"),
+            "suspension does not keep the UWP background-media sponsor and playback snapshot alive");
+        Assert(!prepare.Contains("_ringPlayer.PauseAsync") &&
+               !prepare.Contains("_mediaPlayer?.Pause") &&
+               !prepare.Contains("_librespot.PauseAsync"),
+            "pressing Home can still issue an explicit playback pause");
     }
 
     private static void RepetitiveTelemetryProducesOneSinkEntry()
@@ -396,6 +874,19 @@ internal static class Program
         }
 
         throw new InvalidOperationException("Unable to locate repository root for static UI audit");
+    }
+
+    private static int CountOccurrences(string source, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = source.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+
+        return count;
     }
 
     private static void UpdateMaximum(ref int target, int value)
@@ -1076,6 +1567,59 @@ internal static class Program
             "fallback remained armed after normal TrackChanged");
     }
 
+    private static void PlaylistBoundaryRejectsAlbumContinuation()
+    {
+        const string whisperMyName = "spotify:track:whisper-my-name";
+        const string mph = "spotify:track:mph";
+        const string plotTwist = "spotify:track:plot-twist";
+        var queue = ReadyQueue(new[] { whisperMyName, mph }, whisperMyName, 10, 1);
+        var started = DateTimeOffset.UtcNow;
+        var transition = queue.BeginEndOfTrack(whisperMyName, 10, 1, started);
+
+        var unexpected = queue.ObserveTrackChanged(
+            plotTwist,
+            11,
+            1,
+            started.AddMilliseconds(80));
+
+        Assert(unexpected != null && unexpected.RequiresCorrection,
+            "librespot's album continuation was accepted as the playlist continuation");
+        Assert(queue.Snapshot.CurrentIndex == 0,
+            "the unexpected album continuation advanced the application playlist");
+
+        ApplicationQueueTransition correction;
+        Assert(queue.TryClaimFallback(
+                transition.QueueGenerationId,
+                transition.TransitionId,
+                out correction),
+            "the unexpected album continuation disarmed the application correction");
+        Assert(correction.ExpectedUri == mph,
+            "the correction did not retain the next track from the playlist context");
+
+        var corrected = queue.ObserveTrackChanged(mph, 12, 1, started.AddMilliseconds(160));
+        Assert(corrected != null && !corrected.RequiresCorrection && corrected.ActualChangedUri == mph,
+            "the corrected playlist track was not accepted");
+        Assert(queue.Snapshot.CurrentIndex == 1,
+            "the corrected playlist track did not advance the application queue");
+
+        var repositoryRoot = FindRepositoryRoot();
+        var mediaService = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "LibreSpotUWP",
+            "Services",
+            "MediaService.cs"));
+        var correctionCheck = mediaService.IndexOf(
+            "transitionResult?.RequiresCorrection == true",
+            StringComparison.Ordinal);
+        var statePublication = mediaService.IndexOf(
+            "var queueSnapshot = _applicationQueue.Snapshot;",
+            correctionCheck,
+            StringComparison.Ordinal);
+        Assert(correctionCheck >= 0 && statePublication > correctionCheck &&
+               mediaService.Contains("CorrectUnexpectedApplicationQueueTrackAsync"),
+            "MediaService does not correct an album continuation before publishing it as the current playlist track");
+    }
+
     private static void UnavailableSpotifyContextUsesApplicationFallback()
     {
         var queue = ReadyQueue(new[] { "a", "b" }, "a", 10, 1);
@@ -1315,5 +1859,20 @@ internal static class Program
     {
         if (!condition)
             throw new InvalidOperationException(message);
+    }
+
+    private static void AssertThrows<TException>(Action action, string message)
+        where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(message);
     }
 }

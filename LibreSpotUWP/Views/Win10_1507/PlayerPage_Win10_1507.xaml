@@ -227,6 +227,15 @@
                         TextAlignment="Center"
                         TextTrimming="CharacterEllipsis" />
                 </Button>
+                <TextBlock
+                    x:Name="NarrationTextBlock"
+                    MaxWidth="620"
+                    MaxLines="3"
+                    Margin="0,6,0,0"
+                    FontSize="15"
+                    TextAlignment="Center"
+                    TextWrapping="Wrap"
+                    Visibility="Collapsed" />
             </StackPanel>
 
             <Grid
@@ -343,6 +352,19 @@
                     Margin="0,0,20,0"
                     Click="NextButton_Click">
                     <SymbolIcon Symbol="Next" />
+                </Button>
+
+                <Button
+                    x:Name="NextDjSetButton"
+                    Height="40"
+                    Margin="0,0,20,0"
+                    Padding="10,0"
+                    Visibility="Collapsed"
+                    AutomationProperties.AutomationId="NextVibeButton"
+                    AutomationProperties.Name="Next vibe"
+                    ToolTipService.ToolTip="Skip to the next Spotify DJ vibe"
+                    Click="NextDjSetButton_Click">
+                    <TextBlock Text="Next vibe" />
                 </Button>
 
                 <Button

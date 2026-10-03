@@ -22,6 +22,7 @@ namespace LibreSpotUWP.Controls
         private bool _isReady = false;
         private string _currentArtworkUri = null;
         private bool _loadingOutputDevices;
+        private bool _changingOutputDevice;
         private bool _loadingSpotifyConnectDevices;
         private bool _spotifyConnectDropdownOpen;
         private bool _spotifyConnectRefreshPending;
@@ -99,12 +100,13 @@ namespace LibreSpotUWP.Controls
 
             if (!_positionSeekInteraction.IsDragging)
             {
-                PositionSlider.Maximum = state.DurationMs;
+                PositionSlider.Maximum = state.DisplayDurationMs;
                 PositionSlider.Value = state.PositionMs;
                 CurrentTime.Text = Format(state.PositionMs);
             }
 
-            TotalTime.Text = Format(state.DurationMs);
+            PositionSlider.IsEnabled = !state.IsNarrationActive;
+            TotalTime.Text = Format(state.DisplayDurationMs);
 
             PlayPauseIcon.Glyph = state.IsPlaying ? "\uE769" : "\uE768";
             PersistButton.Visibility = Visibility.Visible;
@@ -222,10 +224,11 @@ namespace LibreSpotUWP.Controls
 
         private async Task LoadOutputDevicesAsync()
         {
-            if (_media == null || OutputDeviceComboBox == null)
+            if (_media == null || OutputDeviceComboBox == null || _loadingOutputDevices)
                 return;
 
             _loadingOutputDevices = true;
+            OutputDeviceComboBox.IsEnabled = false;
             try
             {
                 var devices = await _media.GetAudioOutputDevicesAsync();
@@ -237,15 +240,31 @@ namespace LibreSpotUWP.Controls
             finally
             {
                 _loadingOutputDevices = false;
+                OutputDeviceComboBox.IsEnabled = !_changingOutputDevice;
             }
         }
 
         private async void OutputDeviceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_loadingOutputDevices || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || _media == null)
+            if (_loadingOutputDevices || _changingOutputDevice || !(OutputDeviceComboBox.SelectedItem is AudioOutputDeviceInfo device) || _media == null)
                 return;
 
-            await _media.SetAudioOutputDeviceAsync(device.Id);
+            _changingOutputDevice = true;
+            OutputDeviceComboBox.IsEnabled = false;
+            try
+            {
+                await _media.SetAudioOutputDeviceAsync(device.Id);
+            }
+            catch (Exception ex)
+            {
+                LogService.Warn($"[MediaControllerBar.OutputDeviceComboBox_SelectionChanged] Unable to change audio output: {ex}");
+                await LoadOutputDevicesAsync();
+            }
+            finally
+            {
+                _changingOutputDevice = false;
+                OutputDeviceComboBox.IsEnabled = !_loadingOutputDevices;
+            }
         }
 
         private async Task LoadSpotifyConnectDevicesAsync()
@@ -412,6 +431,12 @@ namespace LibreSpotUWP.Controls
 
         private void UpdateArtistButton(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+            {
+                TrackArtistButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = string.IsNullOrWhiteSpace(GetTrackArtist(state))
                 ? Visibility.Collapsed
@@ -424,6 +449,9 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackTitle(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+                return state.DisplayTitle;
+
             return FirstText(
                 state?.Metadata?.Name,
                 state?.Track?.Name,
@@ -432,6 +460,9 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackArtist(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+                return state.DisplayArtist;
+
             var metadataArtists = state?.Metadata?.Artists?
                 .Select(artist => artist?.Name)
                 .Where(name => !string.IsNullOrWhiteSpace(name));

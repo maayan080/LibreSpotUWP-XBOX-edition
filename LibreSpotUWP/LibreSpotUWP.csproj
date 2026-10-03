@@ -180,6 +180,7 @@
     <Compile Include="Helpers\ImageUriHelper.cs" />
     <Compile Include="Helpers\NowPlayingLyricsPresenter.cs" />
     <Compile Include="Helpers\PlaybackNavigationHelper.cs" />
+    <Compile Include="Helpers\StorageStatisticsHelper.cs" />
     <Compile Include="Helpers\UserSettings.cs" />
     <Compile Include="Helpers\UwpBackgroundExecutionManager.cs" />
     <Compile Include="Helpers\UwpSettingsNavigator.cs" />
@@ -196,6 +197,7 @@
     </Compile>
     <Compile Include="Converters\Converters.cs" />
     <Compile Include="Helpers\AudioFormatProbe.cs" />
+    <Compile Include="Helpers\AudioKeyCompatibilityWarning.cs" />
     <Compile Include="Helpers\BarcodeHelper.cs" />
     <Compile Include="Helpers\AppResetHelper.cs" />
     <Compile Include="Helpers\NavigationHelper.cs" />
@@ -205,9 +207,11 @@
       <DependentUpon>XboxLoginPage.xaml</DependentUpon>
     </Compile>
     <Compile Include="Helpers\PremiumRequiredDialog.cs" />
+    <Compile Include="Helpers\PlaybackAuthorizationDialog.cs" />
+    <Compile Include="Helpers\PlaybackBrowserAuthorizationHelper.cs" />
     <Compile Include="Helpers\QrLoginHelper.cs" />
     <Compile Include="Helpers\SpotifyIdHelper.cs" />
-    <Compile Include="Helpers\SpotifyDjSupportHelper.cs" />
+    <Compile Include="Helpers\SpotifyDjHelper.cs" />
     <Compile Include="Models\CacheResponse.cs" />
     <Compile Include="Models\BulkObservableCollection.cs" />
     <Compile Include="Interfaces\ISpotifyWebService.cs" />
@@ -215,6 +219,7 @@
     <Compile Include="Interfaces\IMetadataCache.cs" />
     <Compile Include="Interfaces\ILibrespotService.cs" />
     <Compile Include="Interfaces\ISpotifyAuthService.cs" />
+    <Compile Include="Interfaces\ISpotifyPlaybackAuthService.cs" />
     <Compile Include="Interfaces\IMediaService.cs" />
     <Compile Include="Interfaces\IAppShell.cs" />
     <Compile Include="Models\Enums.cs" />
@@ -237,7 +242,11 @@
     <Compile Include="Models\LibrespotPositionUpdate.cs" />
     <Compile Include="Models\LibrespotTrackInfo.cs" />
     <Compile Include="Models\LibrespotSessionState.cs" />
+    <Compile Include="Models\LibrespotNarrationState.cs" />
+    <Compile Include="Models\LibrespotDjState.cs" />
     <Compile Include="Models\AuthState.cs" />
+    <Compile Include="Models\LoginPackage.cs" />
+    <Compile Include="Models\PlaybackAuthState.cs" />
     <Compile Include="Interfaces\ISecureStorage.cs" />
     <Compile Include="Services\AppearanceService.cs" />
     <Compile Include="Services\AudioKeyCache.cs" />
@@ -245,6 +254,8 @@
     <Compile Include="Services\SecureStorage.cs" />
     <Compile Include="Exceptions\SpotifyWebExceptions.cs" />
     <Compile Include="Services\SpotifyAuthService.cs" />
+    <Compile Include="Services\PlaybackAccountIdentityValidator.cs" />
+    <Compile Include="Services\SpotifyPlaybackAuthService.cs" />
     <Compile Include="Services\FileMetadataCache.cs" />
     <Compile Include="Services\FileSystem.cs" />
     <Compile Include="Services\LogService.cs" />

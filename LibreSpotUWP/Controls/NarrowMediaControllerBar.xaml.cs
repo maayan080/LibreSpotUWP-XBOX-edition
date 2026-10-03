@@ -95,13 +95,13 @@ namespace LibreSpotUWP.Controls
 
         private void UpdateProgress(MediaState state)
         {
-            if (state == null || state.DurationMs == 0)
+            if (state == null || state.DisplayDurationMs == 0)
             {
                 ProgressFill.Width = 0;
                 return;
             }
 
-            double pct = (double)state.PositionMs / state.DurationMs;
+            double pct = (double)state.PositionMs / state.DisplayDurationMs;
             ProgressFill.Width = pct * ActualWidth;
         }
 
@@ -219,6 +219,12 @@ namespace LibreSpotUWP.Controls
 
         private void UpdateArtistButton(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+            {
+                TrackArtistButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+
             var artists = GetTrackArtists(state);
             TrackArtistButton.Visibility = string.IsNullOrWhiteSpace(GetTrackArtist(state))
                 ? Visibility.Collapsed
@@ -231,6 +237,9 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackTitle(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+                return state.DisplayTitle;
+
             return FirstText(
                 state?.Metadata?.Name,
                 state?.Track?.Name);
@@ -238,6 +247,9 @@ namespace LibreSpotUWP.Controls
 
         private static string GetTrackArtist(MediaState state)
         {
+            if (state?.IsNarrationActive == true)
+                return state.DisplayArtist;
+
             var metadataArtists = state?.Metadata?.Artists?
                 .Select(artist => artist?.Name)
                 .Where(name => !string.IsNullOrWhiteSpace(name));
