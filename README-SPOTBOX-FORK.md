@@ -81,25 +81,14 @@ Upstream offers three sign-in routes, and on a console two of them are dead ends
   plus the Desktop VCLibs that WebView2 pulls in, and the output is a `.msix` rather than
   a `.appx`.
 
-#### Sign in from a phone or PC (LAN pairing)
+#### One button
 
-Because typing on a console is miserable, this fork adds a small HTTP server
-(`Services/XboxPairingServer.cs`) that runs only while the sign-in screen is open, on Xbox
-only. The console displays a QR code and an address such as `http://192.168.1.50:8080/`.
-Open it on any device on the same network, paste the details from the Login Helper, press
-Send, and the session goes straight to the Xbox.
-
-**Why it carries a session blob rather than doing OAuth on the phone.** The obvious design —
-sign in on the phone and let it hand the token back — cannot work: Spotify requires redirect
-URIs to be HTTPS or loopback, so a LAN address like `http://192.168.1.50:8080/callback` can
-never be registered and the authorisation code has no route home. The blob the Login Helper
-produces is ordinary JSON with no relationship to Spotify's redirect rules, so transporting
-*that* is unrestricted.
-
-This needs the `privateNetworkClientServer` capability, added to the manifest. It serves
-plain HTTP carrying credentials, which is acceptable only because it is LAN-only,
-user-initiated, and short-lived — the listener stops the moment a session arrives rather
-than staying open.
+On Xbox the sign-in screen shows a single **Sign in with Spotify** button that opens
+`XboxLoginPage` (the in-app WebView2 flow above). The Login Helper, QR, paste and client-ID
+options are hidden on Xbox (`OobePage.ApplyXboxSignInUi`), and the earlier LAN pairing
+server (`XboxPairingServer`, plus its `privateNetworkClientServer` capability) was removed:
+it depended on the desktop Login Helper, was never confirmed working on a console, and made
+the screen confusing.
 
 You can still enter your own client ID if you prefer; the built-in one is only a fallback.
 Note it belongs to the upstream author's Spotify app registration — if you intend heavy or

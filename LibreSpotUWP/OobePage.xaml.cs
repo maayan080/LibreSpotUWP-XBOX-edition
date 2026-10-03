@@ -51,8 +51,6 @@ namespace LibreSpotUWP
 
             UpdateDirectSignInUi();
             await RefreshSignedInStateAsync();
-
-            await StartPairingServerAsync();
         }
 
         private void OobePage_Unloaded(object sender, RoutedEventArgs e)
@@ -62,62 +60,6 @@ namespace LibreSpotUWP
                 App.SpotifyAuth.AuthStateChanged -= SpotifyAuth_AuthStateChanged;
                 _listeningForAuthState = false;
             }
-
-            StopPairingServer();
-        }
-
-        private Services.XboxPairingServer _pairingServer;
-
-        private async Task StartPairingServerAsync()
-        {
-            if (!OSHelper.IsXboxFamily) { return; }
-            if (_pairingServer != null) { return; }
-
-            try
-            {
-                _pairingServer = new Services.XboxPairingServer();
-                _pairingServer.SessionReceived += PairingServer_SessionReceived;
-
-                if (!await _pairingServer.StartAsync())
-                {
-                    StopPairingServer();
-                    return;
-                }
-
-                PairingUrlText.Text = _pairingServer.Url;
-                PairingQrImage.Source =
-                    await Services.BarcodeUIService.GenerateQrCodeBitmapAsync(_pairingServer.Url, 260);
-                PairingPanel.Visibility = Visibility.Visible;
-            }
-            catch (Exception ex)
-            {
-                LogService.Warn("Pairing server could not start: " + ex.Message);
-                StopPairingServer();
-            }
-        }
-
-        private void StopPairingServer()
-        {
-            var server = _pairingServer;
-            _pairingServer = null;
-
-            if (server != null)
-            {
-                server.SessionReceived -= PairingServer_SessionReceived;
-                server.Dispose();
-            }
-        }
-
-        private async void PairingServer_SessionReceived(object sender, string session)
-        {
-            await Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, async () =>
-            {
-                StopPairingServer();
-                PairingPanel.Visibility = Visibility.Collapsed;
-
-                await QrLoginHelper.ImportQrLoginAsync(session, App.SpotifyAuth, SetBusy);
-                await RefreshSignedInStateAsync();
-            });
         }
 
         private async void SpotifyAuth_AuthStateChanged(object sender, AuthState e)
@@ -305,6 +247,13 @@ namespace LibreSpotUWP
 
         private void UpdateDirectSignInUi()
         {
+            // SPOTBOX FORK: on Xbox show one button and hide every other sign-in option.
+            if (OSHelper.IsXboxFamily)
+            {
+                ApplyXboxSignInUi();
+                return;
+            }
+
             DirectSignInPanel.Visibility = OSHelper.SupportsBrowserSpotifyLogin
                 ? Visibility.Visible
                 : Visibility.Collapsed;
@@ -321,35 +270,30 @@ namespace LibreSpotUWP
             DirectSignInStatusText.Text = hasClientId
                 ? "Direct browser sign-in is enabled for this device."
                 : "Sign in with your Spotify account in the browser. A custom client ID is optional - leave it blank to use the built-in one.";
-
-            if (OSHelper.IsXboxFamily)
-            {
-                BtnScanQr.Visibility = Visibility.Collapsed;
-                BtnOpenHelper.Visibility = Visibility.Collapsed;
-                ReorderForXbox();
-            }
         }
 
-        private void ReorderForXbox()
+        private void ApplyXboxSignInUi()
         {
-            var panel = SignInOptionsPanel;
-            if (panel == null) { return; }
+            HowItWorksIntro.Text =
+                "Sign in with your Spotify account on the next screen. You log in right here on " +
+                "the console, using the normal Spotify sign-in page.";
+            HowItWorksDirect.Visibility = Visibility.Collapsed;
+            HowItWorksQrWarning.Visibility = Visibility.Collapsed;
 
-            const int insertAt = 2;
+            SignInDescription.Text =
+                "Press the button to sign in. A Spotify Premium account is required.";
 
-            MoveChildTo(panel, DirectSignInPanel, insertAt);
-            MoveChildTo(panel, PairingPanel, insertAt + 1);
+            BtnOpenHelper.Visibility = Visibility.Collapsed;
+            BtnScanQr.Visibility = Visibility.Collapsed;
+            BtnPasteDetails.Visibility = Visibility.Collapsed;
+            DirectSignInPanel.Visibility = Visibility.Collapsed;
+
+            XboxSignInPanel.Visibility = Visibility.Visible;
         }
 
-        private static void MoveChildTo(Panel parent, UIElement child, int index)
+        private void BtnXboxSignIn_Click(object sender, RoutedEventArgs e)
         {
-            if (child == null) { return; }
-
-            int current = parent.Children.IndexOf(child);
-            if (current < 0) { return; }
-
-            parent.Children.RemoveAt(current);
-            parent.Children.Insert(Math.Min(index, parent.Children.Count), child);
+            Frame?.Navigate(typeof(XboxLoginPage));
         }
 
         private void SetBusy(bool isBusy)
@@ -362,6 +306,7 @@ namespace LibreSpotUWP
             BtnPasteDetails.IsEnabled = !isBusy;
             BtnSaveClientId.IsEnabled = !isBusy;
             BtnSpotifySignIn.IsEnabled = !isBusy;
+            BtnXboxSignIn.IsEnabled = !isBusy;
         }
     }
 }

@@ -89,6 +89,7 @@
                                 TextWrapping="WrapWholeWords" />
 
                             <TextBlock
+                                x:Name="HowItWorksIntro"
                                 Style="{StaticResource BodyTextStyle}"
                                 Text="LibreSpotUWP needs a Spotify login session before the main app opens. The easiest path is to use the LibreSpotUWP Login Helper on another Windows device, then scan the QR code or paste the sign-in details here." />
 
@@ -98,10 +99,12 @@
                                 Text="A Spotify Premium account is required. Spotify Free accounts are not supported by LibreSpotUWP." />
 
                             <TextBlock
+                                x:Name="HowItWorksDirect"
                                 Style="{StaticResource BodyTextStyle}"
                                 Text="You can also sign in directly with Spotify on supported desktop devices after setting a Spotify client ID. If you are on a phone or do not know what that means, use the Login Helper path." />
 
                             <TextBlock
+                                x:Name="HowItWorksQrWarning"
                                 Style="{StaticResource BodyTextStyle}"
                                 Text="Only import QR codes or sign-in text that you created yourself. They contain your login session." />
 
@@ -134,9 +137,27 @@
                                     TextWrapping="WrapWholeWords" />
 
                                 <TextBlock
+                                    x:Name="SignInDescription"
                                     Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"
                                     Style="{StaticResource BodyTextStyle}"
                                     Text="Choose one of these sign-in methods. The QR and paste options work well for Windows phones because the Login Helper can prepare the session on another device. LibreSpotUWP will reject Spotify Free accounts." />
+
+                                <!-- SPOTBOX FORK: Xbox shows this single button instead of the four
+                                     desktop/phone sign-in options. Shown only on Xbox (see OobePage.xaml.cs). -->
+                                <StackPanel
+                                    x:Name="XboxSignInPanel"
+                                    Margin="0,12,0,12"
+                                    Visibility="Collapsed">
+                                    <Button
+                                        x:Name="BtnXboxSignIn"
+                                        MinWidth="320"
+                                        MinHeight="64"
+                                        HorizontalAlignment="Center"
+                                        Click="BtnXboxSignIn_Click"
+                                        Content="Sign in with Spotify"
+                                        FontSize="22"
+                                        Style="{ThemeResource AccentButtonStyle}" />
+                                </StackPanel>
 
                                 <Button
                                     x:Name="BtnOpenHelper"
@@ -185,37 +206,6 @@
                                         </StackPanel>
                                     </Grid>
                                 </Button>
-
-                                <Border
-                                    x:Name="PairingPanel"
-                                    Padding="20"
-                                    Background="#1E1E1E"
-                                    CornerRadius="8"
-                                    Visibility="Collapsed">
-                                    <StackPanel>
-                                        <TextBlock
-                                            FontWeight="SemiBold"
-                                            Text="Sign in from your phone or PC" />
-                                        <TextBlock
-                                            Margin="0,4,0,12"
-                                            Opacity="0.72"
-                                            Text="Scan this code, or open the address below in a browser on any device on your network. Paste the details from the Login Helper there and they will be sent straight to this Xbox."
-                                            TextWrapping="Wrap" />
-                                        <Image
-                                            x:Name="PairingQrImage"
-                                            Width="260"
-                                            Height="260"
-                                            Margin="0,0,0,12"
-                                            HorizontalAlignment="Left" />
-                                        <TextBlock
-                                            x:Name="PairingUrlText"
-                                            FontFamily="Consolas"
-                                            FontSize="20"
-                                            Foreground="#1DB954"
-                                            IsTextSelectionEnabled="True"
-                                            Text="" />
-                                    </StackPanel>
-                                </Border>
 
                                 <Button
                                     x:Name="BtnPasteDetails"
